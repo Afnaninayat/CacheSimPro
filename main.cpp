@@ -213,6 +213,8 @@ static void ApplyModernTheme() {
 }
 
 int main(int argc, char* argv[]) {
+    (void)argc;
+    (void)argv;
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         std::cerr << "Error initializing SDL: " << SDL_GetError() << std::endl;
         return -1;
@@ -269,6 +271,7 @@ int main(int argc, char* argv[]) {
     bool active_hit = false;
     bool active_evicted = false;
     uint64_t active_addr = 0;
+    (void)active_addr;
 
     bool auto_play = false;
     float auto_play_speed_ms = 300.0f;
@@ -546,8 +549,8 @@ int main(int argc, char* argv[]) {
             ImGui::Text("Bit Breakdown: [ Tag: %u bits | Set Index: %u bits | Offset: %u bits ]", 
                         tag_bits, index_bits, offset_bits);
             ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), 
-                        "-> Tag: 0x%lX | Set Index: %u | Offset: 0x%X", 
-                        tag_val, set_idx, block_offset);
+                        "-> Tag: 0x%llX | Set Index: %u | Offset: 0x%X", 
+                        (unsigned long long)tag_val, set_idx, block_offset);
         } else {
             ImGui::TextDisabled("Configure cache to view bit decoder.");
         }
@@ -643,13 +646,13 @@ int main(int argc, char* argv[]) {
         float miss_ratio = total > 0 ? (float)misses / total : 0.0f;
 
         ImGui::Columns(3, "MetricCols", false);
-        ImGui::Text("HITS: %lu", hits);
+        ImGui::Text("HITS: %llu", (unsigned long long)hits);
         ImGui::ProgressBar(hit_ratio, ImVec2(-1, 14), ""); ImGui::NextColumn();
 
-        ImGui::Text("MISSES: %lu", misses);
+        ImGui::Text("MISSES: %llu", (unsigned long long)misses);
         ImGui::ProgressBar(miss_ratio, ImVec2(-1, 14), ""); ImGui::NextColumn();
 
-        ImGui::Text("EVICTIONS: %lu", evictions);
+        ImGui::Text("EVICTIONS: %llu", (unsigned long long)evictions);
         float eviction_ratio = total > 0 ? (float)evictions / total : 0.0f;
         ImGui::ProgressBar(eviction_ratio, ImVec2(-1, 14), ""); ImGui::NextColumn();
         ImGui::Columns(1);
@@ -697,10 +700,12 @@ int main(int argc, char* argv[]) {
                         }
 
                         if (line.valid) {
-                            ImGui::Text("V:1 | Tag: 0x%lX", line.tag);
+                            ImGui::Text("V:1 | Tag: 0x%llX", (unsigned long long)line.tag);
                             if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Set: %u | Way: %u\nTag: 0x%lX\nLast Access: %lu\nInsertion Time: %lu", 
-                                                  s, w, line.tag, line.last_access, line.insertion_time);
+                                ImGui::SetTooltip("Set: %u | Way: %u\nTag: 0x%llX\nLast Access: %llu\nInsertion Time: %llu", 
+                                                  s, w, (unsigned long long)line.tag, 
+                                                  (unsigned long long)line.last_access, 
+                                                  (unsigned long long)line.insertion_time);
                             }
                         } else {
                             ImGui::TextDisabled("V:0 | Tag: ---");
