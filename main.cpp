@@ -17,6 +17,9 @@
 #include <bitset>
 #include <cstdio>
 #include <future>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 struct TraceEntry {
     char op;
@@ -26,6 +29,10 @@ struct TraceEntry {
 // Global non-blocking native file dialog state
 static std::future<std::string> g_file_dialog_future;
 static bool g_file_dialog_pending = false;
+
+// Global ImGui File Picker Modal State
+static bool show_file_picker_modal = false;
+static std::string current_picker_dir = "/home/cl4/Desktop/Afnaninayat/cache_simulator";
 
 // Preset Configuration Options
 struct ValueOption {
@@ -40,7 +47,8 @@ static const ValueOption CACHE_SIZE_OPTIONS[] = {
     {2048,  "2 KB (2048 B)"},
     {4096,  "4 KB (4096 B)"},
     {8192,  "8 KB (8192 B)"},
-    {16384, "16 KB (16384 B)"}
+    {16384, "16 KB (16384 B)"},
+    {65536, "64 KB (65536 B)"}
 };
 
 static const ValueOption BLOCK_SIZE_OPTIONS[] = {
@@ -70,7 +78,7 @@ static std::string trim(const std::string& str) {
 // Open Native Linux OS File Chooser Dialog (Zenity) synchronously in worker thread
 static std::string OpenNativeFileDialogSync() {
     std::string filePath = "";
-    FILE* pipe = popen("zenity --file-selection --title=\"Select Memory Trace File\" --file-filter=\"Trace Files (*.txt *.trace) | *.txt *.trace\" --file-filter=\"All Files | *\" 2>/dev/null", "r");
+    FILE* pipe = popen("zenity --file-selection --title=\"Select Memory Trace File\" 2>/dev/null", "r");
     if (pipe) {
         char buffer[2048];
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
@@ -179,6 +187,7 @@ static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_
         current_step = 0;
         cache.reset();
         execution_logs.clear();
+        execution_logs.push_back("[Info] Loaded " + std::to_string(trace_entries.size()) + " trace instructions from '" + cleanPath + "'");
 
         if (trace_entries.empty()) {
             status_message = "Error: File '" + cleanPath + "' opened, but contained 0 valid trace instructions.";
@@ -186,11 +195,11 @@ static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_
             return false;
         }
 
-        status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions from '" + cleanPath + "'";
+        status_message = "Successfully loaded " + std::to_string(trace_entries.size()) + " instructions from '" + cleanPath + "'";
         status_is_error = false;
         return true;
     } else {
-        status_message = "Error: Could not open trace file '" + cleanPath + "'. Check file path.";
+        status_message = "Error: Could not open trace file '" + cleanPath + "'. File does not exist.";
         status_is_error = true;
         return false;
     }
@@ -199,39 +208,35 @@ static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_
 // Format execution log entry
 static std::string formatLogEntry(const StepResult& res) {
     std::ostringstream ss;
-    ss << "[" << (res.op == 'W' ? "WRITE" : "READ ") << "] "
-       << "Addr: 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << res.address
-       << " -> Set " << std::dec << res.set_index
-       << ", Tag 0x" << std::hex << std::uppercase << res.tag << " -> ";
-
+    ss << "[Sim] Accessing 0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(4) << res.address << ": ";
     if (res.hit) {
-        ss << "HIT (Way " << std::dec << res.way << ")";
+        ss << "Cache Hit in Set " << std::dec << res.set_index << ", Way " << res.way;
     } else if (res.evicted) {
-        ss << "MISS & EVICT (Way " << std::dec << res.evicted_way << ")";
+        ss << "Cache Miss in Set " << std::dec << res.set_index << "; Evicting Way " << res.evicted_way << " & Loading line...";
     } else {
-        ss << "MISS (Way " << std::dec << res.way << " Filled)";
+        ss << "Cache Miss in Set " << std::dec << res.set_index << "; Loading line into Way " << res.way << "...";
     }
     return ss.str();
 }
 
-static void ApplyUltraTheme() {
+static void ApplySimCacheTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
     
-    style.WindowPadding     = ImVec2(12.0f, 12.0f);
-    style.FramePadding      = ImVec2(10.0f, 6.0f);
+    style.WindowPadding     = ImVec2(14.0f, 14.0f);
+    style.FramePadding      = ImVec2(10.0f, 7.0f);
     style.ItemSpacing       = ImVec2(10.0f, 8.0f);
     style.ItemInnerSpacing  = ImVec2(8.0f, 6.0f);
     style.IndentSpacing     = 18.0f;
-    style.ScrollbarSize     = 13.0f;
-    style.GrabMinSize       = 13.0f;
+    style.ScrollbarSize     = 12.0f;
+    style.GrabMinSize       = 12.0f;
 
     style.WindowRounding    = 8.0f;
-    style.ChildRounding     = 7.0f;
-    style.FrameRounding     = 5.0f;
+    style.ChildRounding     = 8.0f;
+    style.FrameRounding     = 6.0f;
     style.PopupRounding     = 6.0f;
     style.ScrollbarRounding = 6.0f;
-    style.GrabRounding      = 5.0f;
-    style.TabRounding       = 5.0f;
+    style.GrabRounding      = 6.0f;
+    style.TabRounding       = 6.0f;
 
     style.WindowBorderSize  = 1.0f;
     style.ChildBorderSize   = 1.0f;
@@ -239,45 +244,45 @@ static void ApplyUltraTheme() {
     style.FrameBorderSize   = 1.0f;
 
     ImVec4* colors = style.Colors;
-    colors[ImGuiCol_Text]                  = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);
-    colors[ImGuiCol_TextDisabled]          = ImVec4(0.52f, 0.58f, 0.65f, 1.00f);
-    colors[ImGuiCol_WindowBg]              = ImVec4(0.06f, 0.08f, 0.11f, 1.00f);
-    colors[ImGuiCol_ChildBg]               = ImVec4(0.10f, 0.13f, 0.17f, 0.98f);
-    colors[ImGuiCol_PopupBg]               = ImVec4(0.11f, 0.14f, 0.19f, 1.00f);
-    colors[ImGuiCol_Border]                = ImVec4(0.19f, 0.24f, 0.31f, 1.00f);
+    colors[ImGuiCol_Text]                  = ImVec4(0.92f, 0.95f, 0.98f, 1.00f);
+    colors[ImGuiCol_TextDisabled]          = ImVec4(0.48f, 0.54f, 0.62f, 1.00f);
+    colors[ImGuiCol_WindowBg]              = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_ChildBg]               = ImVec4(0.09f, 0.12f, 0.16f, 0.98f);
+    colors[ImGuiCol_PopupBg]               = ImVec4(0.10f, 0.14f, 0.19f, 1.00f);
+    colors[ImGuiCol_Border]                = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
     colors[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    colors[ImGuiCol_FrameBg]               = ImVec4(0.14f, 0.18f, 0.24f, 1.00f);
-    colors[ImGuiCol_FrameBgHovered]        = ImVec4(0.20f, 0.26f, 0.35f, 1.00f);
-    colors[ImGuiCol_FrameBgActive]         = ImVec4(0.25f, 0.32f, 0.42f, 1.00f);
-    colors[ImGuiCol_TitleBg]               = ImVec4(0.06f, 0.08f, 0.11f, 1.00f);
-    colors[ImGuiCol_TitleBgActive]         = ImVec4(0.12f, 0.16f, 0.22f, 1.00f);
-    colors[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.06f, 0.08f, 0.11f, 1.00f);
-    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.10f, 0.13f, 0.17f, 1.00f);
-    colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.06f, 0.08f, 0.11f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.20f, 0.26f, 0.34f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.28f, 0.36f, 0.48f, 1.00f);
-    colors[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.34f, 0.44f, 0.58f, 1.00f);
-    colors[ImGuiCol_CheckMark]             = ImVec4(0.25f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrab]            = ImVec4(0.25f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_SliderGrabActive]      = ImVec4(0.40f, 0.80f, 1.00f, 1.00f);
-    colors[ImGuiCol_Button]                = ImVec4(0.15f, 0.21f, 0.29f, 1.00f);
-    colors[ImGuiCol_ButtonHovered]         = ImVec4(0.22f, 0.31f, 0.44f, 1.00f);
-    colors[ImGuiCol_ButtonActive]          = ImVec4(0.28f, 0.40f, 0.56f, 1.00f);
-    colors[ImGuiCol_Header]                = ImVec4(0.16f, 0.24f, 0.34f, 1.00f);
-    colors[ImGuiCol_HeaderHovered]         = ImVec4(0.24f, 0.34f, 0.48f, 1.00f);
-    colors[ImGuiCol_HeaderActive]          = ImVec4(0.30f, 0.42f, 0.58f, 1.00f);
-    colors[ImGuiCol_Separator]             = ImVec4(0.19f, 0.24f, 0.31f, 1.00f);
-    colors[ImGuiCol_SeparatorHovered]      = ImVec4(0.25f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_SeparatorActive]       = ImVec4(0.40f, 0.80f, 1.00f, 1.00f);
-    colors[ImGuiCol_ResizeGrip]            = ImVec4(0.20f, 0.26f, 0.34f, 1.00f);
-    colors[ImGuiCol_ResizeGripHovered]     = ImVec4(0.25f, 0.70f, 1.00f, 1.00f);
-    colors[ImGuiCol_ResizeGripActive]      = ImVec4(0.40f, 0.80f, 1.00f, 1.00f);
-    colors[ImGuiCol_Tab]                   = ImVec4(0.10f, 0.14f, 0.20f, 1.00f);
-    colors[ImGuiCol_TabHovered]            = ImVec4(0.22f, 0.31f, 0.44f, 1.00f);
-    colors[ImGuiCol_TabActive]             = ImVec4(0.18f, 0.26f, 0.38f, 1.00f);
-    colors[ImGuiCol_TableHeaderBg]         = ImVec4(0.12f, 0.16f, 0.22f, 1.00f);
-    colors[ImGuiCol_TableBorderStrong]     = ImVec4(0.19f, 0.24f, 0.31f, 1.00f);
-    colors[ImGuiCol_TableBorderLight]      = ImVec4(0.15f, 0.19f, 0.25f, 1.00f);
+    colors[ImGuiCol_FrameBg]               = ImVec4(0.12f, 0.16f, 0.22f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered]        = ImVec4(0.18f, 0.24f, 0.32f, 1.00f);
+    colors[ImGuiCol_FrameBgActive]         = ImVec4(0.22f, 0.30f, 0.40f, 1.00f);
+    colors[ImGuiCol_TitleBg]               = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]         = ImVec4(0.10f, 0.14f, 0.19f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_MenuBarBg]             = ImVec4(0.09f, 0.12f, 0.16f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg]           = ImVec4(0.07f, 0.09f, 0.12f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrab]         = ImVec4(0.18f, 0.24f, 0.32f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.24f, 0.32f, 0.44f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.30f, 0.40f, 0.54f, 1.00f);
+    colors[ImGuiCol_CheckMark]             = ImVec4(0.00f, 0.80f, 0.95f, 1.00f);
+    colors[ImGuiCol_SliderGrab]            = ImVec4(0.12f, 0.53f, 0.90f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive]      = ImVec4(0.00f, 0.80f, 0.95f, 1.00f);
+    colors[ImGuiCol_Button]                = ImVec4(0.12f, 0.17f, 0.24f, 1.00f);
+    colors[ImGuiCol_ButtonHovered]         = ImVec4(0.18f, 0.26f, 0.36f, 1.00f);
+    colors[ImGuiCol_ButtonActive]          = ImVec4(0.24f, 0.34f, 0.48f, 1.00f);
+    colors[ImGuiCol_Header]                = ImVec4(0.14f, 0.20f, 0.28f, 1.00f);
+    colors[ImGuiCol_HeaderHovered]         = ImVec4(0.20f, 0.28f, 0.40f, 1.00f);
+    colors[ImGuiCol_HeaderActive]          = ImVec4(0.26f, 0.36f, 0.50f, 1.00f);
+    colors[ImGuiCol_Separator]             = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
+    colors[ImGuiCol_SeparatorHovered]      = ImVec4(0.00f, 0.80f, 0.95f, 1.00f);
+    colors[ImGuiCol_SeparatorActive]       = ImVec4(0.00f, 0.90f, 1.00f, 1.00f);
+    colors[ImGuiCol_ResizeGrip]            = ImVec4(0.18f, 0.24f, 0.32f, 1.00f);
+    colors[ImGuiCol_ResizeGripHovered]     = ImVec4(0.00f, 0.80f, 0.95f, 1.00f);
+    colors[ImGuiCol_ResizeGripActive]      = ImVec4(0.00f, 0.90f, 1.00f, 1.00f);
+    colors[ImGuiCol_Tab]                   = ImVec4(0.09f, 0.12f, 0.16f, 1.00f);
+    colors[ImGuiCol_TabHovered]            = ImVec4(0.18f, 0.26f, 0.36f, 1.00f);
+    colors[ImGuiCol_TabActive]             = ImVec4(0.14f, 0.20f, 0.28f, 1.00f);
+    colors[ImGuiCol_TableHeaderBg]         = ImVec4(0.11f, 0.15f, 0.21f, 1.00f);
+    colors[ImGuiCol_TableBorderStrong]     = ImVec4(0.18f, 0.23f, 0.30f, 1.00f);
+    colors[ImGuiCol_TableBorderLight]      = ImVec4(0.14f, 0.18f, 0.24f, 1.00f);
 }
 
 int main(int argc, char* argv[]) {
@@ -307,7 +312,7 @@ int main(int argc, char* argv[]) {
     }
 
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window* window = SDL_CreateWindow("USTP Digital IC Design - Parameterized Cache Simulator", 
+    SDL_Window* window = SDL_CreateWindow("SimCache Pro - Advanced Cache Simulator", 
                                           SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
                                           target_w, target_h, window_flags);
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
@@ -319,37 +324,29 @@ int main(int argc, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ApplyUltraTheme();
+    ApplySimCacheTheme();
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     CacheCore cache;
     int config_mode = 0; // 0: Presets, 1: Custom User Values
-    int cache_size_idx = 2; // Default 1024 B
+    int cache_size_idx = 7; // Default 64 KB
     int block_size_idx = 2; // Default 64 B
     int assoc_idx = 2;      // Default 4-Way
     int selected_policy = 0; // 0: LRU, 1: FIFO, 2: Random
 
-    int custom_cache_size = 1024;
+    int custom_cache_size = 65536;
     int custom_block_size = 64;
     int custom_associativity = 4;
 
-    char trace_buffer[65536] = 
-        "R 0x1000\n"
-        "W 0x1004\n"
-        "R 0x2000\n"
-        "R 0x1000\n"
-        "R 0x1040\n"
-        "W 0x3000\n"
-        "R 0x1000\n";
-
+    char trace_buffer[65536] = "";
     char trace_file_path[256] = "trace.txt";
     std::vector<TraceEntry> trace_entries;
     size_t current_step = 0;
 
     std::vector<std::string> execution_logs;
-    std::string status_message = "Ready. Enter memory trace or click 'RUN ALL' / 'STEP'.";
+    std::string status_message = "Ready. Select or load a trace file.";
     bool status_is_error = false;
 
     int active_set = -1;
@@ -374,6 +371,8 @@ int main(int argc, char* argv[]) {
     int init_bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
     int init_as = ASSOC_OPTIONS[assoc_idx].value;
     cache.configure(init_cs, init_bs, init_as, ReplacementPolicy::LRU);
+    
+    // Load default trace.txt at startup
     loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
 
     bool running = true;
@@ -384,6 +383,19 @@ int main(int argc, char* argv[]) {
             if (event.type == SDL_QUIT) running = false;
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window))
                 running = false;
+        }
+
+        // Non-blocking Native File Dialog Handler
+        if (g_file_dialog_pending && g_file_dialog_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            std::string selectedFile = g_file_dialog_future.get();
+            g_file_dialog_pending = false;
+            if (!selectedFile.empty()) {
+                if (selectedFile.size() < sizeof(trace_file_path)) {
+                    std::copy(selectedFile.begin(), selectedFile.end(), trace_file_path);
+                    trace_file_path[selectedFile.size()] = '\0';
+                }
+                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+            }
         }
 
         // Auto-play timer logic
@@ -447,20 +459,23 @@ int main(int argc, char* argv[]) {
         // =========================================================
         ImGui::BeginChild("HeaderBar", ImVec2(0, 48), true, ImGuiWindowFlags_NoScrollbar);
         ImGui::SetCursorPosY(10.0f);
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "  USTP DIGITAL IC DESIGN");
+        
+        // Brand Badge Icon & Title
+        ImGui::TextColored(ImVec4(0.12f, 0.58f, 0.95f, 1.00f), "  SimCache Pro");
         ImGui::SameLine();
-        ImGui::TextDisabled("| Parameterized Cache Architecture Simulator");
+        ImGui::TextDisabled("- Advanced Cache Simulator");
 
-        ImGui::SameLine(ImGui::GetWindowWidth() - 360.0f);
-        ImGui::TextDisabled("[%dx%d]", (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        ImGui::SameLine();
+        ImGui::SameLine(ImGui::GetWindowWidth() - 320.0f);
         if (auto_play) {
-            ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.45f, 1.0f), "[AUTO-PLAY ACTIVE]");
+            ImGui::TextColored(ImVec4(0.00f, 0.90f, 0.45f, 1.0f), "[AUTO-PLAY ACTIVE]");
         } else if (current_step > 0 && current_step >= trace_entries.size()) {
-            ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[SIMULATION COMPLETE]");
+            ImGui::TextColored(ImVec4(0.12f, 0.58f, 0.95f, 1.00f), "[SIMULATION COMPLETE]");
         } else {
             ImGui::TextDisabled("[STANDBY READY]");
         }
+
+        ImGui::SameLine();
+        ImGui::TextDisabled("  |  [Config]");
         ImGui::EndChild();
 
         // =========================================================
@@ -469,46 +484,46 @@ int main(int argc, char* argv[]) {
         static bool init_split = false;
         if (!init_split) {
             ImGui::Columns(2, "MainLayout", true);
-            ImGui::SetColumnWidth(0, std::clamp(io.DisplaySize.x * 0.38f, 480.0f, 620.0f));
+            ImGui::SetColumnWidth(0, std::clamp(io.DisplaySize.x * 0.48f, 520.0f, 700.0f));
             init_split = true;
         } else {
             ImGui::Columns(2, "MainLayout", true);
         }
 
         // ---------------------------------------------------------
-        // LEFT COLUMN: CONFIGURATION, ACTION BAR, DECODER, TRACE
+        // LEFT COLUMN: CONFIGURATION & TRACE EDITOR
         // ---------------------------------------------------------
         
-        // 1. Freely Editable Cache Configuration Panel
-        ImGui::BeginChild("ConfigPanel", ImVec2(0, 260), true);
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[CONFIG] CACHE ARCHITECTURE CONFIGURATION");
+        // 1. Configuration Panel (Top Left)
+        ImGui::BeginChild("ConfigPanel", ImVec2(0, 310), true);
+        ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Configuration");
         ImGui::Separator();
 
-        // Toggle Mode: Preset Dropdowns vs Custom User Manual Inputs
+        // Mode Toggle
         ImGui::TextDisabled("Input Mode:");
         ImGui::SameLine();
-        if (ImGui::RadioButton("Presets Dropdown", config_mode == 0)) {
+        if (ImGui::RadioButton("Presets", config_mode == 0)) {
             config_mode = 0;
         }
         ImGui::SameLine();
-        if (ImGui::RadioButton("Custom User Inputs", config_mode == 1)) {
+        if (ImGui::RadioButton("Custom", config_mode == 1)) {
             config_mode = 1;
         }
 
-        ImGui::Separator();
+        ImGui::Spacing();
 
         if (config_mode == 0) {
-            // Preset Dropdowns Mode
-            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 140.0f);
+            // Dropdown Mode matching mockup
+            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
             
-            const char* cs_labels[] = { "256 Bytes", "512 Bytes", "1 KB (1024 B)", "2 KB (2048 B)", "4 KB (4096 B)", "8 KB (8192 B)", "16 KB (16384 B)" };
-            if (ImGui::Combo("Cache Size", &cache_size_idx, cs_labels, IM_ARRAYSIZE(cs_labels))) {
+            const char* cs_labels[] = { "256 Bytes", "512 Bytes", "1 KB", "2 KB", "4 KB", "8 KB", "16 KB", "64 KB" };
+            if (ImGui::Combo("Cache Size (KB)", &cache_size_idx, cs_labels, IM_ARRAYSIZE(cs_labels))) {
                 int cs = CACHE_SIZE_OPTIONS[cache_size_idx].value;
                 int bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
                 int as = ASSOC_OPTIONS[assoc_idx].value;
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(cs, bs, as, pol)) {
-                    status_message = "Warning: Selected combination (Size/Block/Assoc) is invalid.";
+                    status_message = "Warning: Selected combination is invalid.";
                     status_is_error = true;
                 } else {
                     status_message = "Reconfigured: " + std::to_string(cs) + "B Size, " + std::to_string(bs) + "B Block.";
@@ -519,7 +534,7 @@ int main(int argc, char* argv[]) {
             }
 
             const char* bs_labels[] = { "16 Bytes", "32 Bytes", "64 Bytes", "128 Bytes", "256 Bytes" };
-            if (ImGui::Combo("Block Size", &block_size_idx, bs_labels, IM_ARRAYSIZE(bs_labels))) {
+            if (ImGui::Combo("Block Size (Bytes)", &block_size_idx, bs_labels, IM_ARRAYSIZE(bs_labels))) {
                 int cs = CACHE_SIZE_OPTIONS[cache_size_idx].value;
                 int bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
                 int as = ASSOC_OPTIONS[assoc_idx].value;
@@ -535,7 +550,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            const char* as_labels[] = { "1-Way (Direct Mapped)", "2-Way Set Associative", "4-Way Set Associative", "8-Way Set Associative", "16-Way Set Associative" };
+            const char* as_labels[] = { "1-Way Direct", "2-Way Set Associative", "4-Way Set Associative", "8-Way Set Associative", "16-Way Set Associative" };
             if (ImGui::Combo("Associativity", &assoc_idx, as_labels, IM_ARRAYSIZE(as_labels))) {
                 int cs = CACHE_SIZE_OPTIONS[cache_size_idx].value;
                 int bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
@@ -552,8 +567,8 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            const char* policy_list[] = { "LRU (Least Recently Used)", "FIFO (First In First Out)", "Random Replacement" };
-            if (ImGui::Combo("Policy", &selected_policy, policy_list, IM_ARRAYSIZE(policy_list))) {
+            const char* policy_list[] = { "LRU", "FIFO", "Random" };
+            if (ImGui::Combo("Replacement Policy", &selected_policy, policy_list, IM_ARRAYSIZE(policy_list))) {
                 int cs = CACHE_SIZE_OPTIONS[cache_size_idx].value;
                 int bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
                 int as = ASSOC_OPTIONS[assoc_idx].value;
@@ -563,23 +578,23 @@ int main(int argc, char* argv[]) {
 
             ImGui::PopItemWidth();
         } else {
-            // Freely Editable Custom Numerical Inputs Mode
-            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 160.0f);
+            // Numerical Custom Inputs
+            ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
             ImGui::InputInt("Cache Size (B)", &custom_cache_size, 256, 1024);
             ImGui::InputInt("Block Size (B)", &custom_block_size, 16, 64);
             ImGui::InputInt("Associativity (n)", &custom_associativity, 1, 2);
 
-            const char* policy_list[] = { "LRU (Least Recently Used)", "FIFO (First In First Out)", "Random Replacement" };
-            ImGui::Combo("Policy", &selected_policy, policy_list, IM_ARRAYSIZE(policy_list));
+            const char* policy_list[] = { "LRU", "FIFO", "Random" };
+            ImGui::Combo("Replacement Policy", &selected_policy, policy_list, IM_ARRAYSIZE(policy_list));
             ImGui::PopItemWidth();
 
-            if (ImGui::Button(" Apply Custom Parameters ", ImVec2(-1, 28))) {
+            if (ImGui::Button(" Apply Parameters ", ImVec2(-1, 26))) {
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(custom_cache_size, custom_block_size, custom_associativity, pol)) {
-                    status_message = "Error: Parameters must be Powers of 2 (Size >= Block Size >= 16, Assoc <= Lines).";
+                    status_message = "Error: Parameters must be Powers of 2.";
                     status_is_error = true;
                 } else {
-                    status_message = "Custom parameters applied: " + std::to_string(custom_cache_size) + "B Size, " + std::to_string(custom_block_size) + "B Block, " + std::to_string(custom_associativity) + "-Way.";
+                    status_message = "Applied custom parameters.";
                     status_is_error = false;
                     execution_logs.clear();
                     current_step = 0;
@@ -587,28 +602,11 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Architectural parameters summary badge
-        if (cache.isConfigured()) {
-            uint32_t num_sets = cache.getNumSets();
-            uint32_t block_size = cache.getBlockSize();
-            uint32_t offset_bits = static_cast<uint32_t>(std::log2(block_size));
-            uint32_t index_bits = static_cast<uint32_t>(std::log2(num_sets));
-            uint32_t tag_bits = 64 - index_bits - offset_bits;
-
-            ImGui::Separator();
-            ImGui::TextDisabled("Derived Specs:");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.85f, 1.0f), "Sets: %u  |  Tag: %ub  |  Index: %ub  |  Offset: %ub",
-                               num_sets, tag_bits, index_bits, offset_bits);
-        }
-
-        ImGui::EndChild();
-
-        // 2. Action Toolbar & Playback Controls Panel
-        ImGui::BeginChild("ActionPanel", ImVec2(0, 110), true);
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[CONTROLS] SIMULATION CONTROLS");
+        ImGui::Spacing();
         ImGui::Separator();
+        ImGui::Spacing();
 
+        // Button Toolbar Bar matching Mockup exactly
         auto ensureTraceLoaded = [&]() {
             if (trace_entries.empty()) {
                 trace_entries = parseTraceText(trace_buffer);
@@ -618,15 +616,28 @@ int main(int argc, char* argv[]) {
             }
         };
 
-        // Proportional Button Sizing
         float avail_w = ImGui::GetContentRegionAvail().x;
-        float btn_w = (avail_w - 30.0f) / 4.0f;
+        float btn_w = (avail_w - 24.0f) / 4.0f;
 
-        // Run All Button (Emerald Green)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.55f, 0.30f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.70f, 0.38f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.24f, 0.80f, 0.44f, 1.0f));
-        if (ImGui::Button(" RUN ALL ", ImVec2(btn_w, 32))) {
+        // Load Trace Button (Blue) -> Loads file if specified, else opens picker
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.62f, 0.98f, 1.0f));
+        if (ImGui::Button(" Load Trace ", ImVec2(btn_w, 34))) {
+            if (strlen(trace_file_path) > 0 && fs::exists(trace_file_path)) {
+                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+            } else {
+                show_file_picker_modal = true;
+                g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
+                g_file_dialog_pending = true;
+            }
+        }
+        ImGui::PopStyleColor(2);
+
+        // Run Simulation Button (Emerald Green)
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.78f, 0.38f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.00f, 0.90f, 0.45f, 1.0f));
+        if (ImGui::Button(" Run Simulation ", ImVec2(btn_w + 20.0f, 34))) {
             ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
@@ -654,15 +665,12 @@ int main(int argc, char* argv[]) {
                 status_is_error = false;
             }
         }
-        ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Execute all trace instructions instantly to final state.");
+        ImGui::PopStyleColor(2);
 
-        // Step Button (Deep Sky Blue)
+        // Step Button
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.75f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.58f, 0.88f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.25f, 0.68f, 0.98f, 1.0f));
-        if (ImGui::Button(" STEP ", ImVec2(btn_w, 32))) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
+        if (ImGui::Button(" Step ", ImVec2(btn_w - 10.0f, 34))) {
             ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
@@ -693,40 +701,12 @@ int main(int argc, char* argv[]) {
                 status_is_error = false;
             }
         }
-        ImGui::PopStyleColor(3);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Execute a single trace instruction step-by-step.");
+        ImGui::PopStyleColor();
 
-        // Auto Play / Pause Toggle
+        // Reset Button
         ImGui::SameLine();
-        if (auto_play) {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.40f, 0.10f, 1.0f));
-            if (ImGui::Button(" PAUSE ", ImVec2(btn_w, 32))) auto_play = false;
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.40f, 0.25f, 0.65f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.52f, 0.35f, 0.80f, 1.0f));
-            if (ImGui::Button(" AUTO ", ImVec2(btn_w, 32))) {
-                ensureTraceLoaded();
-
-                if (!cache.isConfigured()) {
-                    status_message = "Error: Cache configuration invalid.";
-                    status_is_error = true;
-                } else if (trace_entries.empty()) {
-                    status_message = "Error: Memory trace instructions are empty.";
-                    status_is_error = true;
-                } else {
-                    auto_play = true;
-                }
-            }
-            ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Automatically step through trace at set timer interval.");
-        }
-
-        // Reset Button (Muted Dark Red)
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.50f, 0.15f, 0.15f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.68f, 0.22f, 0.22f, 1.0f));
-        if (ImGui::Button(" RESET ", ImVec2(btn_w, 32))) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
+        if (ImGui::Button(" Reset ", ImVec2(btn_w - 10.0f, 34))) {
             cache.reset();
             trace_entries = parseTraceText(trace_buffer);
             execution_logs.clear();
@@ -734,220 +714,121 @@ int main(int argc, char* argv[]) {
             active_set = -1;
             active_way = -1;
             auto_play = false;
-            status_message = "Cache reset complete. All state cleared.";
+            status_message = "Cache reset complete.";
             status_is_error = false;
         }
-        ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear cache state and restart trace index to 0.");
-
-        // Speed Slider Inline
-        ImGui::PushItemWidth(avail_w - 70.0f);
-        ImGui::SliderFloat("Speed", &auto_play_speed_ms, 50.0f, 1000.0f, "%.0f ms / step");
-        ImGui::PopItemWidth();
+        ImGui::PopStyleColor();
 
         ImGui::EndChild();
 
-        // 3. Hardware Address Bit Decoder
-        ImGui::BeginChild("DecoderPanel", ImVec2(0, 160), true);
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[DECODER] HARDWARE ADDRESS BIT DECODER");
+        // 2. Trace Editor Panel (Bottom Left)
+        ImGui::BeginChild("TraceEditorPanel", ImVec2(0, 0), true);
+        ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Trace Editor");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 40.0f);
+        ImGui::TextDisabled("...");
         ImGui::Separator();
 
-        ImGui::PushItemWidth(150);
-        ImGui::InputText("Address", inspect_addr_str, IM_ARRAYSIZE(inspect_addr_str));
+        // Direct File Path Input + Load File Button + Browse Dialog Button
+        ImGui::TextDisabled("Trace File:");
+        ImGui::SameLine();
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
+        if (ImGui::InputText("##TraceFilePathInput", trace_file_path, IM_ARRAYSIZE(trace_file_path), ImGuiInputTextFlags_EnterReturnsTrue)) {
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        }
         ImGui::PopItemWidth();
 
-        uint64_t dec_addr = 0;
-        try {
-            std::string str = inspect_addr_str;
-            if (str.find("0x") == 0 || str.find("0X") == 0) {
-                dec_addr = std::stoull(str, nullptr, 16);
-            } else {
-                dec_addr = std::stoull(str, nullptr, 10);
-            }
-        } catch (...) {}
-
-        if (cache.isConfigured()) {
-            uint32_t block_size = cache.getBlockSize();
-            uint32_t num_sets = cache.getNumSets();
-
-            uint32_t offset_bits = static_cast<uint32_t>(std::log2(block_size));
-            uint32_t index_bits = static_cast<uint32_t>(std::log2(num_sets));
-            uint32_t tag_bits = 64 - index_bits - offset_bits;
-
-            uint32_t set_idx = (dec_addr >> offset_bits) & (num_sets - 1);
-            uint64_t tag_val = dec_addr >> (offset_bits + index_bits);
-            uint32_t block_offset = dec_addr & (block_size - 1);
-
-            // Visual Badges
-            ImGui::TextDisabled("Extracted Fields:");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.00f, 1.0f), "[TAG: 0x%llX (%ub)]", (unsigned long long)tag_val, tag_bits);
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.85f, 1.0f), "[SET: %u (%ub)]", set_idx, index_bits);
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.00f, 0.60f, 0.20f, 1.0f), "[OFFSET: 0x%X (%ub)]", block_offset, offset_bits);
-
-            // Bit-level Binary Display
-            ImGui::TextDisabled("64-Bit Binary Sequence:");
-            std::string bin_str = std::bitset<64>(dec_addr).to_string();
-
-            ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
-            for (size_t b = 0; b < 64; ++b) {
-                size_t bitIndexFromLSB = 63 - b;
-                char bitChar[2] = { bin_str[b], '\0' };
-
-                if (bitIndexFromLSB >= (offset_bits + index_bits)) {
-                    ImGui::TextColored(ImVec4(0.35f, 0.70f, 1.00f, 1.0f), "%s", bitChar);
-                } else if (bitIndexFromLSB >= offset_bits) {
-                    ImGui::TextColored(ImVec4(0.20f, 0.85f, 0.85f, 1.0f), "%s", bitChar);
-                } else {
-                    ImGui::TextColored(ImVec4(1.00f, 0.60f, 0.20f, 1.0f), "%s", bitChar);
-                }
-
-                if (b < 63 && (b + 1) % 4 == 0) {
-                    ImGui::SameLine();
-                    ImGui::TextDisabled(" ");
-                }
-                if (b < 63) ImGui::SameLine();
-            }
-            ImGui::PopStyleVar();
-        } else {
-            ImGui::TextDisabled("Configure cache to inspect address bit fields.");
+        ImGui::SameLine();
+        if (ImGui::Button(" Load File ")) {
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
         }
 
-        ImGui::EndChild();
+        ImGui::SameLine();
+        if (ImGui::Button(" Browse... ")) {
+            show_file_picker_modal = true;
+            g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
+            g_file_dialog_pending = true;
+        }
 
-        // 4. Interactive User Memory Trace Panel
-        ImGui::BeginChild("TracePanel", ImVec2(0, 0), true);
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[TRACE] USER MEMORY TRACE INPUT & EDITOR");
         ImGui::Separator();
 
-        // Interactive Quick Add Instruction Form
-        ImGui::TextDisabled("Add Custom Instruction:");
-        const char* ops[] = { "READ (R)", "WRITE (W)" };
-        ImGui::PushItemWidth(110);
-        ImGui::Combo("##QuickOp", &quick_op_idx, ops, IM_ARRAYSIZE(ops));
+        // Quick Instruction Entry Form
+        ImGui::TextDisabled("Add Instruction:");
+        ImGui::SameLine();
+        const char* ops[] = { "R", "W" };
+        ImGui::PushItemWidth(55);
+        ImGui::Combo("##OpSelect", &quick_op_idx, ops, IM_ARRAYSIZE(ops));
         ImGui::PopItemWidth();
 
         ImGui::SameLine();
-        ImGui::PushItemWidth(130);
-        ImGui::InputText("##QuickAddr", quick_addr_input, IM_ARRAYSIZE(quick_addr_input));
+        ImGui::PushItemWidth(95);
+        ImGui::InputText("##AddrInput", quick_addr_input, IM_ARRAYSIZE(quick_addr_input));
         ImGui::PopItemWidth();
 
         ImGui::SameLine();
-        if (ImGui::Button(" [+] Add Instruction ")) {
+        if (ImGui::Button(" Add ")) {
             std::string lineStr = std::string(quick_op_idx == 0 ? "R " : "W ") + quick_addr_input + "\n";
             size_t currentLen = strlen(trace_buffer);
             if (currentLen + lineStr.size() < sizeof(trace_buffer)) {
                 strcat(trace_buffer, lineStr.c_str());
                 trace_entries = parseTraceText(trace_buffer);
-                status_message = "Added instruction: " + lineStr;
-                status_is_error = false;
             }
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Append this access instruction to user trace buffer.");
 
         ImGui::SameLine();
-        if (ImGui::Button(" [-] Clear Trace ")) {
+        if (ImGui::Button(" Clear ")) {
             trace_buffer[0] = '\0';
             trace_entries.clear();
             current_step = 0;
             cache.reset();
             execution_logs.clear();
-            status_message = "Memory trace buffer cleared. Ready for custom user trace input.";
-            status_is_error = false;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Clear trace buffer completely to enter new custom trace.");
 
-        ImGui::Separator();
+        ImGui::Spacing();
 
-        // Trace File Load & Presets
-        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
-        if (ImGui::InputText("File Path", trace_file_path, IM_ARRAYSIZE(trace_file_path), ImGuiInputTextFlags_EnterReturnsTrue)) {
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-        ImGui::PopItemWidth();
+        // Line numbers gutter + Monospaced text area split
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 0.0f));
         
-        ImGui::SameLine();
-        if (ImGui::Button("Load File")) {
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-
-        ImGui::SameLine();
-        if (g_file_dialog_pending) {
-            ImGui::Button("Browsing...", ImVec2(80, 0));
-        } else {
-            if (ImGui::Button(" [Browse] ")) {
-                g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
-                g_file_dialog_pending = true;
+        float full_avail_y = ImGui::GetContentRegionAvail().y - 20.0f;
+        
+        // Line Gutter Panel
+        ImGui::BeginChild("LineGutter", ImVec2(38, full_avail_y), false, ImGuiWindowFlags_NoScrollbar);
+        std::istringstream gstream(trace_buffer);
+        std::string gline;
+        int lnum = 1;
+        while (std::getline(gstream, gline)) {
+            char lbuf[16];
+            snprintf(lbuf, sizeof(lbuf), "%02d", lnum++);
+            if (lnum - 1 == (int)current_step + 1) {
+                ImGui::TextColored(ImVec4(0.00f, 0.80f, 0.95f, 1.0f), "● %s", lbuf);
+            } else {
+                ImGui::TextDisabled("  %s", lbuf);
             }
         }
+        ImGui::EndChild();
 
-        // Non-blocking file dialog check
-        if (g_file_dialog_pending && g_file_dialog_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            std::string selectedFile = g_file_dialog_future.get();
-            g_file_dialog_pending = false;
-            if (!selectedFile.empty()) {
-                if (selectedFile.size() < sizeof(trace_file_path)) {
-                    std::copy(selectedFile.begin(), selectedFile.end(), trace_file_path);
-                    trace_file_path[selectedFile.size()] = '\0';
-                }
-                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-            }
-        }
+        ImGui::SameLine();
 
-        // Presets Buttons
-        ImGui::TextDisabled("Presets:");
-        ImGui::SameLine();
-        if (ImGui::Button("[Default]")) {
-            snprintf(trace_file_path, sizeof(trace_file_path), "trace.txt");
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("[Loop]")) {
-            snprintf(trace_file_path, sizeof(trace_file_path), "trace_loop.txt");
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("[Thrash]")) {
-            snprintf(trace_file_path, sizeof(trace_file_path), "trace_thrash.txt");
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-
-        // Live Trace Text Area (Parses continuously on keystroke)
+        // Multiline Text Buffer
         if (ImGui::InputTextMultiline("##TraceEditorArea", trace_buffer, IM_ARRAYSIZE(trace_buffer), 
-                                      ImVec2(-1, -26), ImGuiInputTextFlags_AllowTabInput)) {
+                                      ImVec2(-1, full_avail_y), ImGuiInputTextFlags_AllowTabInput)) {
             trace_entries = parseTraceText(trace_buffer);
             current_step = 0;
         }
+        ImGui::PopStyleVar();
 
-        ImGui::TextDisabled("User Trace Count: %zu instructions | Step Index: %zu", trace_entries.size(), current_step);
+        ImGui::TextDisabled("Trace Count: %zu instructions | File: %s", trace_entries.size(), trace_file_path);
 
         ImGui::EndChild();
 
         ImGui::NextColumn();
 
         // ---------------------------------------------------------
-        // RIGHT COLUMN: METRIC CARDS, VISUALIZER MATRIX & LOGS
+        // RIGHT COLUMN: RESULTS PANEL & CACHE VISUALIZATION
         // ---------------------------------------------------------
         ImGui::BeginChild("RightContainer", ImVec2(0, 0), true);
 
-        // Status Callout Banner
-        if (!status_message.empty()) {
-            ImVec4 bannerBg = status_is_error ? ImVec4(0.40f, 0.12f, 0.12f, 0.9f) : ImVec4(0.12f, 0.35f, 0.20f, 0.9f);
-            ImVec4 bannerBorder = status_is_error ? ImVec4(0.90f, 0.30f, 0.30f, 1.0f) : ImVec4(0.25f, 0.80f, 0.45f, 1.0f);
-            
-            ImGui::PushStyleColor(ImGuiCol_ChildBg, bannerBg);
-            ImGui::PushStyleColor(ImGuiCol_Border, bannerBorder);
-            ImGui::BeginChild("StatusCallout", ImVec2(0, 34), true, ImGuiWindowFlags_NoScrollbar);
-            ImGui::SetCursorPosY(6.0f);
-            ImGui::TextColored(bannerBorder, " %s  %s", status_is_error ? "[ERR]" : "[INFO]", status_message.c_str());
-            ImGui::EndChild();
-            ImGui::PopStyleColor(2);
-        }
-        
-        // 1. Statistics Cards Dashboard
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[METRICS] PERFORMANCE METRICS DASHBOARD");
+        // 1. Results Panel (Top Right Dashboard Cards)
+        ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Results Panel");
         ImGui::Separator();
 
         uint64_t hits = cache.getHits();
@@ -957,74 +838,86 @@ int main(int argc, char* argv[]) {
 
         float hit_ratio = total > 0 ? (float)hits / total : 0.0f;
         float miss_ratio = total > 0 ? (float)misses / total : 0.0f;
+        (void)miss_ratio;
 
-        // Dynamic 3-Column Responsive Grid
-        float card_width = (ImGui::GetContentRegionAvail().x - 20.0f) / 3.0f;
+        float c_width = (ImGui::GetContentRegionAvail().x - 20.0f) / 2.0f;
 
-        ImGui::Columns(3, "MetricsGrid", false);
-        ImGui::SetColumnWidth(0, card_width + 10.0f);
-        ImGui::SetColumnWidth(1, card_width + 10.0f);
-        
-        // Hits Card
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.10f, 0.22f, 0.15f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.18f, 0.65f, 0.35f, 1.0f));
-        ImGui::BeginChild("HitCard", ImVec2(0, 64), true);
-        ImGui::TextDisabled("HITS");
-        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1.0f), "%llu", (unsigned long long)hits);
-        ImGui::SameLine(ImGui::GetWindowWidth() - 65.0f);
-        ImGui::TextColored(ImVec4(0.25f, 0.85f, 0.45f, 1.0f), "%.1f%%", hit_ratio * 100.0f);
+        ImGui::Columns(2, "ResultsGrid", false);
+        ImGui::SetColumnWidth(0, c_width + 10.0f);
+
+        // Cache Hits Card (Cyan/Emerald Highlight Card matching mockup)
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.20f, 0.26f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.00f, 0.70f, 0.90f, 1.0f));
+        ImGui::BeginChild("HitCard", ImVec2(0, 68), true);
+        ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.95f, 1.0f), "[v] Cache Hits");
+        ImGui::TextColored(ImVec4(1.00f, 1.00f, 1.00f, 1.0f), "%llu", (unsigned long long)hits);
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::NextColumn();
 
-        // Misses Card
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.24f, 0.18f, 0.08f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.85f, 0.60f, 0.15f, 1.0f));
-        ImGui::BeginChild("MissCard", ImVec2(0, 64), true);
-        ImGui::TextDisabled("MISSES");
-        ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.18f, 1.0f), "%llu", (unsigned long long)misses);
-        ImGui::SameLine(ImGui::GetWindowWidth() - 65.0f);
-        ImGui::TextColored(ImVec4(0.95f, 0.68f, 0.18f, 1.0f), "%.1f%%", miss_ratio * 100.0f);
+        // Cache Misses Card (Red/Dark Card matching mockup)
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.18f, 0.12f, 0.14f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.65f, 0.20f, 0.25f, 1.0f));
+        ImGui::BeginChild("MissCard", ImVec2(0, 68), true);
+        ImGui::TextColored(ImVec4(0.85f, 0.40f, 0.45f, 1.0f), "[!] Cache Misses");
+        ImGui::TextColored(ImVec4(1.00f, 1.00f, 1.00f, 1.0f), "%llu", (unsigned long long)misses);
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::NextColumn();
 
         // Evictions Card
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.22f, 0.10f, 0.10f, 0.9f));
-        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.80f, 0.25f, 0.25f, 1.0f));
-        ImGui::BeginChild("EvictCard", ImVec2(0, 64), true);
-        ImGui::TextDisabled("EVICTIONS");
-        ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%llu", (unsigned long long)evictions);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.20f, 0.15f, 0.08f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.80f, 0.50f, 0.15f, 1.0f));
+        ImGui::BeginChild("EvictCard", ImVec2(0, 68), true);
+        ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.20f, 1.0f), "[T] Evictions");
+        ImGui::TextColored(ImVec4(1.00f, 1.00f, 1.00f, 1.0f), "%llu", (unsigned long long)evictions);
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
+        ImGui::NextColumn();
+
+        // Hit Rate % Card
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.18f, 0.18f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.00f, 0.75f, 0.60f, 1.0f));
+        ImGui::BeginChild("HitRateCard", ImVec2(0, 68), true);
+        ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.70f, 1.0f), "[~] Hit Rate %%");
+        ImGui::TextColored(ImVec4(1.00f, 1.00f, 1.00f, 1.0f), "%.1f%%", hit_ratio * 100.0f);
         ImGui::EndChild();
         ImGui::PopStyleColor(2);
         ImGui::NextColumn();
 
         ImGui::Columns(1);
 
-        // Hit Rate Bar
-        ImGui::TextDisabled("Hit Rate Ratio:");
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.20f, 0.75f, 0.40f, 1.0f));
-        ImGui::ProgressBar(hit_ratio, ImVec2(-1, 14), "");
-        ImGui::PopStyleColor();
+        // Total Accesses Card (Full Width)
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.16f, 0.22f, 0.9f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.20f, 0.30f, 0.42f, 1.0f));
+        ImGui::BeginChild("TotalCard", ImVec2(0, 46), true);
+        ImGui::TextDisabled("Total Accesses:");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.90f, 0.95f, 1.00f, 1.0f), "%llu instructions", (unsigned long long)total);
+        ImGui::EndChild();
+        ImGui::PopStyleColor(2);
 
         ImGui::Separator();
 
-        // 2. Dynamic Auto-Scaling Cache Visualizer Matrix
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[MATRIX] CACHE STATE MATRIX (Sets x Ways)");
+        // 2. Cache Visualization Table (Bottom Right)
+        ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Cache Visualization");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 40.0f);
+        ImGui::TextDisabled("...");
+
         if (cache.isConfigured() && cache.getNumSets() > 0) {
             uint32_t num_sets = cache.getNumSets();
             uint32_t assoc = cache.getAssociativity();
             const auto& sets = cache.getSets();
 
             float remaining_h = ImGui::GetContentRegionAvail().y;
-            float table_h = std::max(220.0f, remaining_h * 0.58f);
+            float table_h = std::max(200.0f, remaining_h * 0.58f);
 
-            if (ImGui::BeginTable("VisualizerTable", assoc + 1, 
+            if (ImGui::BeginTable("CacheMatrixTable", assoc + 1, 
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, 
                                   ImVec2(0, table_h))) {
                 
                 ImGui::TableSetupScrollFreeze(1, 1);
-                ImGui::TableSetupColumn("Set Index", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+                ImGui::TableSetupColumn("Sets", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                 for (uint32_t w = 0; w < assoc; ++w) {
                     std::string wayHeader = "Way " + std::to_string(w);
                     ImGui::TableSetupColumn(wayHeader.c_str(), ImGuiTableColumnFlags_WidthStretch);
@@ -1035,10 +928,12 @@ int main(int argc, char* argv[]) {
                     ImGui::TableNextRow();
                     ImGui::TableSetColumnIndex(0);
                     
+                    char slabel[32];
+                    snprintf(slabel, sizeof(slabel), "Set %u  S%u", s, s);
                     if (static_cast<int>(s) == active_set) {
-                        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.85f, 1.0f), "Set %u ->", s);
+                        ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.95f, 1.0f), "%s", slabel);
                     } else {
-                        ImGui::Text("Set %u", s);
+                        ImGui::Text("%s", slabel);
                     }
 
                     for (uint32_t w = 0; w < assoc; ++w) {
@@ -1046,35 +941,36 @@ int main(int argc, char* argv[]) {
                         const auto& line = sets[s].lines[w];
 
                         bool isActive = (static_cast<int>(s) == active_set && static_cast<int>(w) == active_way);
+                        
+                        // Custom Cell Backgrounds matching Mockup Image
                         if (isActive) {
                             if (active_hit) {
-                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(25, 140, 60, 255));
+                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(0, 200, 115, 255)); // Emerald Hit
                             } else if (active_evicted) {
-                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(190, 40, 40, 255));
+                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(230, 60, 60, 255)); // Red Miss/Evict
                             } else {
-                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(200, 140, 20, 255));
+                                ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(255, 140, 0, 255)); // Orange Eviction
                             }
+                        } else if (line.valid) {
+                            ImGui::TableSetBgColor(ImGuiTableBgTarget_CellBg, IM_COL32(15, 85, 130, 255)); // Electric Blue Loaded Block
                         }
 
                         if (line.valid) {
                             if (isActive && active_hit) {
-                                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[HIT] 0x%llX", (unsigned long long)line.tag);
+                                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Hit");
                             } else if (isActive && active_evicted) {
-                                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[EVICT] 0x%llX", (unsigned long long)line.tag);
-                            } else if (isActive) {
-                                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "[MISS] 0x%llX", (unsigned long long)line.tag);
+                                ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Miss");
                             } else {
-                                ImGui::Text("0x%llX", (unsigned long long)line.tag);
+                                ImGui::Text("V:1 Tag:0x%X", (unsigned int)line.tag);
                             }
 
                             if (ImGui::IsItemHovered()) {
-                                ImGui::SetTooltip("Location: Set %u, Way %u\nTag Hex: 0x%llX\nLast Access: Tick #%llu\nInsertion: Tick #%llu", 
-                                                  s, w, (unsigned long long)line.tag, 
-                                                  (unsigned long long)line.last_access, 
-                                                  (unsigned long long)line.insertion_time);
+                                ImGui::SetTooltip("Set %u, Way %u\nTag Hex: 0x%X\nLast Used: Tick #%llu", 
+                                                  s, w, (unsigned int)line.tag, 
+                                                  (unsigned long long)line.last_access);
                             }
                         } else {
-                            ImGui::TextDisabled("[EMPTY]");
+                            ImGui::TextDisabled("V:0 Invalid");
                         }
                     }
                 }
@@ -1086,16 +982,16 @@ int main(int argc, char* argv[]) {
 
         ImGui::Separator();
 
-        // 3. Formatted Execution Log Console
-        ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "[LOGS] EXECUTION LOG & TRACE CONSOLE");
-        ImGui::BeginChild("LogConsole", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        // 3. Execution Log (Below Matrix)
+        ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Execution Log");
+        ImGui::BeginChild("ExecutionLogConsole", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
         for (const auto& logEntry : execution_logs) {
-            if (logEntry.find("HIT") != std::string::npos) {
-                ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.45f, 1.0f), "%s", logEntry.c_str());
-            } else if (logEntry.find("EVICT") != std::string::npos) {
-                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "%s", logEntry.c_str());
+            if (logEntry.find("Hit") != std::string::npos) {
+                ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.45f, 1.0f), "%s", logEntry.c_str());
+            } else if (logEntry.find("Evicting") != std::string::npos) {
+                ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f), "%s", logEntry.c_str());
             } else {
-                ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f), "%s", logEntry.c_str());
+                ImGui::TextColored(ImVec4(0.90f, 0.70f, 0.20f, 1.0f), "%s", logEntry.c_str());
             }
         }
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
@@ -1105,11 +1001,72 @@ int main(int argc, char* argv[]) {
 
         ImGui::EndChild();
 
+        // =========================================================
+        // IN-APP FILE SELECTOR POPUP MODAL
+        // =========================================================
+        if (show_file_picker_modal) {
+            ImGui::OpenPopup("Select Memory Trace File");
+        }
+        ImGui::SetNextWindowSize(ImVec2(640, 420), ImGuiCond_FirstUseEver);
+        if (ImGui::BeginPopupModal("Select Memory Trace File", &show_file_picker_modal)) {
+            ImGui::TextDisabled("Current Directory:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.95f, 1.0f), "%s", current_picker_dir.c_str());
+            ImGui::Separator();
+
+            ImGui::BeginChild("FileListRegion", ImVec2(0, 300), true);
+            try {
+                if (ImGui::Selectable(" [..]  Up to Parent Directory")) {
+                    current_picker_dir = fs::path(current_picker_dir).parent_path().string();
+                }
+                ImGui::Separator();
+
+                std::vector<fs::directory_entry> dirs;
+                std::vector<fs::directory_entry> files;
+                for (const auto& entry : fs::directory_iterator(current_picker_dir)) {
+                    if (entry.is_directory()) dirs.push_back(entry);
+                    else files.push_back(entry);
+                }
+
+                std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b){ return a.path().filename() < b.path().filename(); });
+                std::sort(files.begin(), files.end(), [](const auto& a, const auto& b){ return a.path().filename() < b.path().filename(); });
+
+                for (const auto& dirEntry : dirs) {
+                    std::string label = " [DIR]  " + dirEntry.path().filename().string();
+                    if (ImGui::Selectable(label.c_str())) {
+                        current_picker_dir = dirEntry.path().string();
+                    }
+                }
+
+                for (const auto& fileEntry : files) {
+                    std::string fname = fileEntry.path().filename().string();
+                    std::string label = "  [FILE] " + fname;
+                    if (ImGui::Selectable(label.c_str())) {
+                        std::string fullPath = fileEntry.path().string();
+                        snprintf(trace_file_path, sizeof(trace_file_path), "%s", fullPath.c_str());
+                        loadTraceFromFile(fullPath, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+                        show_file_picker_modal = false;
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+            } catch (const std::exception& ex) {
+                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Cannot list directory: %s", ex.what());
+            }
+            ImGui::EndChild();
+
+            ImGui::Separator();
+            if (ImGui::Button(" Cancel ", ImVec2(120, 30))) {
+                show_file_picker_modal = false;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
 
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(0.06f, 0.08f, 0.11f, 1.00f);
+        glClearColor(0.07f, 0.09f, 0.12f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);

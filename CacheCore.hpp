@@ -3,7 +3,6 @@
 
 #include <cstdint>
 #include <vector>
-#include <cmath>
 #include <random>
 #include <algorithm>
 #include <string>
@@ -16,6 +15,7 @@ enum class ReplacementPolicy {
 
 struct CacheLine {
     bool valid = false;
+    bool dirty = false;
     uint64_t tag = 0;
     uint64_t last_access = 0;
     uint64_t insertion_time = 0;
@@ -28,6 +28,7 @@ struct CacheSet {
 struct StepResult {
     bool hit = false;
     bool evicted = false;
+    bool dirty_eviction = false;
     uint32_t set_index = 0;
     uint64_t tag = 0;
     int way = -1;
@@ -42,6 +43,12 @@ public:
 
     static bool isPowerOfTwo(uint32_t val) {
         return (val > 0) && ((val & (val - 1)) == 0);
+    }
+
+    static uint32_t log2_uint(uint32_t val) {
+        uint32_t bits = 0;
+        while (val >>= 1) ++bits;
+        return bits;
     }
 
     bool configure(uint32_t total_cache_size, uint32_t block_size, uint32_t associativity, ReplacementPolicy policy) {
@@ -62,9 +69,9 @@ public:
         m_num_sets = total_lines / m_associativity;
         if (!isPowerOfTwo(m_num_sets)) return false;
 
-        // Bitwise mask offsets for Tag & Set Index calculation
-        m_offset_bits = static_cast<uint32_t>(std::log2(m_block_size));
-        m_index_bits = static_cast<uint32_t>(std::log2(m_num_sets));
+        // Bitwise mask offsets using exact integer log2
+        m_offset_bits = log2_uint(m_block_size);
+        m_index_bits = log2_uint(m_num_sets);
         m_index_mask = m_num_sets - 1;
 
         reset();
@@ -86,7 +93,7 @@ public:
 
     StepResult access(char op, uint64_t address) {
         StepResult res;
-        res.op = op;
+        res.op = (op == 'w' || op == 'W') ? 'W' : 'R';
         res.address = address;
 
         if (!m_configured || m_num_sets == 0) return res;
@@ -105,6 +112,9 @@ public:
                 res.hit = true;
                 res.way = static_cast<int>(i);
                 set.lines[i].last_access = m_access_counter;
+                if (res.op == 'W') {
+                    set.lines[i].dirty = true;
+                }
                 m_hits++;
                 return res;
             }
@@ -121,6 +131,7 @@ public:
                 set.lines[i].tag = res.tag;
                 set.lines[i].last_access = m_access_counter;
                 set.lines[i].insertion_time = m_access_counter;
+                set.lines[i].dirty = (res.op == 'W');
                 res.way = static_cast<int>(i);
                 res.evicted = false;
                 return res;
@@ -132,9 +143,12 @@ public:
         res.evicted = true;
         int victim_way = selectVictim(set);
 
+        res.dirty_eviction = set.lines[victim_way].dirty;
+
         set.lines[victim_way].tag = res.tag;
         set.lines[victim_way].last_access = m_access_counter;
         set.lines[victim_way].insertion_time = m_access_counter;
+        set.lines[victim_way].dirty = (res.op == 'W');
 
         res.way = victim_way;
         res.evicted_way = victim_way;
