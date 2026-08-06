@@ -1,0 +1,14 @@
+# Conflict Thrashing & Eviction Test Trace
+# Maps repeatedly to Set 0 forcing LRU/FIFO line evictions
+R 0x0000
+R 0x0040
+R 0x0080
+R 0x00C0
+R 0x0100
+R 0x0140
+R 0x0180
+R 0x01C0
+R 0x0000
+R 0x0040
+R 0x0080
+R 0x00C0

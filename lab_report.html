@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>USTP Lab Report - Parameterized Cache Simulator in C++</title>
+<style>
+    @media print {
+        body { font-size: 11pt; background: #fff; }
+        .no-print { display: none; }
+        .page-break { page-break-before: always; }
+    }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+        line-height: 1.6;
+        color: #1a202c;
+        max-width: 850px;
+        margin: 0 auto;
+        padding: 40px 20px;
+        background-color: #ffffff;
+    }
+    .header {
+        border-bottom: 3px solid #1e3a8a;
+        padding-bottom: 12px;
+        margin-bottom: 24px;
+    }
+    h1 {
+        color: #1e3a8a;
+        font-size: 22pt;
+        margin: 0 0 6px 0;
+    }
+    .subtitle {
+        color: #475569;
+        font-size: 13pt;
+        font-weight: 500;
+    }
+    h2 {
+        color: #1e40af;
+        border-bottom: 2px solid #e2e8f0;
+        padding-bottom: 6px;
+        margin-top: 28px;
+        font-size: 15pt;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 20px 0;
+    }
+    th, td {
+        border: 1px solid #cbd5e1;
+        padding: 10px 14px;
+        text-align: center;
+    }
+    th {
+        background-color: #f1f5f9;
+        color: #0f172a;
+        font-weight: bold;
+    }
+    tr:nth-child(even) {
+        background-color: #f8fafc;
+    }
+    .code-snippet {
+        background-color: #0f172a;
+        color: #f8fafc;
+        padding: 12px;
+        border-radius: 6px;
+        font-family: "Courier New", Courier, monospace;
+        font-size: 9.5pt;
+    }
+    .print-btn {
+        background-color: #1e3a8a;
+        color: white;
+        border: none;
+        padding: 12px 24px;
+        font-size: 14px;
+        font-weight: bold;
+        border-radius: 6px;
+        cursor: pointer;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(30, 58, 138, 0.25);
+    }
+    .print-btn:hover {
+        background-color: #1e40af;
+    }
+</style>
+</head>
+<body>
+
+<div class="no-print" style="text-align: right;">
+    <button class="print-btn" onclick="window.print()">🖨️ Print / Save Lab Report as PDF</button>
+</div>
+
+<div class="header">
+    <h1>USTP Digital IC Design and Training Program</h1>
+    <div class="subtitle">Lab Project Report: Parameterized Cache Simulator in C++</div>
+</div>
+
+<h2>1. OOP Design & Menu State Management</h2>
+<p>The <strong>Parameterized Cache Simulator</strong> is architected using clean Object-Oriented Programming (OOP) principles in C++17, decoupling the underlying simulation hardware model (<code>CacheCore</code>) from the user interface and state rendering engine (<code>main.cpp</code>).</p>
+
+<h3>Key Classes & Abstractions:</h3>
+<ul>
+    <li><strong><code>CacheLine</code></strong>: Encapsulates valid bit ($V$), 64-bit tag, last access timestamp (for LRU), and insertion timestamp (for FIFO).</li>
+    <li><strong><code>CacheSet</code></strong>: Contains a vector of $N$ <code>CacheLine</code> instances representing associative ways.</li>
+    <li><strong><code>CacheCore</code></strong>: Manages global cache parameters (Cache Size, Block Size, Associativity, Replacement Policy), bitwise address decomposition masks, and simulation step access logic.</li>
+</ul>
+
+<h3>Menu State Management Workflow:</h3>
+<ol>
+    <li><strong>Configuration Validation</strong>: Enforces power-of-2 constraints ($\text{Size} > 0$ and $(\text{val} \& (\text{val}-1)) == 0$). If unconfigured, action buttons display: <code>Error: Please configure cache parameters first.</code></li>
+    <li><strong>Trace Validation</strong>: Ensures parsed memory instructions exist in buffer. If empty, action buttons display: <code>Error: Please load a trace file first.</code></li>
+    <li><strong>Execution State Transition</strong>: Steps incrementally increment <code>current_step</code> pointer, update real-time statistics dashboard, append step records to execution log, and trigger active set/way cell highlighting on the cache visualizer matrix.</li>
+</ol>
+
+<h2>2. Experimental Results & Associativity Comparison</h2>
+<p>The following experimental results were collected using a <strong>256 Byte Cache</strong> with a <strong>64 Byte Block Size</strong> operating under the <strong>LRU (Least Recently Used)</strong> replacement policy across the benchmark memory trace:</p>
+
+<div class="code-snippet">
+R 0x1000  |  W 0x1004  |  R 0x2000  |  R 0x1000  |  R 0x3000  |  R 0x4000  |  R 0x5000
+R 0x1000  |  W 0x2004  |  R 0x6000  |  R 0x1004  |  R 0x3000  |  W 0x7000  |  R 0x1000
+</div>
+
+<table>
+    <thead>
+        <tr>
+            <th>Associativity ($N$)</th>
+            <th>Hits</th>
+            <th>Misses</th>
+            <th>Evictions</th>
+            <th>Hit Rate (%)</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><strong>Direct-Mapped (1-Way)</strong></td>
+            <td>1</td>
+            <td>13</td>
+            <td>12</td>
+            <td><strong>7.14%</strong></td>
+        </tr>
+        <tr>
+            <td><strong>2-Way Set Associative</strong></td>
+            <td>2</td>
+            <td>12</td>
+            <td>10</td>
+            <td><strong>14.29%</strong></td>
+        </tr>
+        <tr>
+            <td><strong>4-Way Set Associative</strong></td>
+            <td>5</td>
+            <td>9</td>
+            <td>5</td>
+            <td><strong>35.71%</strong></td>
+        </tr>
+    </tbody>
+</table>
+
+<h2>3. Architectural Analysis: Why Hit Rate Increases with Associativity</h2>
+<p>In a <strong>Direct-Mapped Cache (1-Way)</strong>, each memory block maps strictly to a single set index ($Index = (Address \gg Offset) \& (Sets - 1)$). When multiple addresses (such as <code>0x1000</code>, <code>0x2000</code>, <code>0x3000</code>, and <code>0x4000</code>) share the exact same set index, severe <strong>Conflict Misses (Thrashing)</strong> occur because each incoming block immediately evicts the previously loaded line, even though total cache storage remains underutilized.</p>
+
+<p>As associativity increases to <strong>2-Way</strong> and <strong>4-Way Set Associative</strong>, multiple cache ways ($N$) become available within each set. This allows concurrently active memory blocks to reside simultaneously within the set without kicking each other out. Consequently, temporal locality is preserved for addresses like <code>0x1000</code> and <code>0x1004</code>, drastically reducing conflict evictions (from 12 evictions down to 5) and increasing the overall Hit Rate from <strong>7.14% to 35.71%</strong>.</p>
+
+</body>
+</html>
