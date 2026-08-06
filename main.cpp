@@ -51,34 +51,44 @@ static std::string OpenNativeFileDialogSync() {
     return filePath;
 }
 
-// Parse memory trace string into structured entries
+// Parse memory trace string into structured entries (Clean & Simple)
 static std::vector<TraceEntry> parseTraceText(const std::string& text) {
     std::vector<TraceEntry> entries;
     std::istringstream stream(text);
     std::string line;
 
     while (std::getline(stream, line)) {
+        // Remove inline comments (#, //, ;)
+        size_t c = line.find_first_of("#/;");
+        if (c != std::string::npos) line = line.substr(0, c);
+
         line = trim(line);
-        if (line.empty() || line[0] == '#' || (line.size() >= 2 && line[0] == '/' && line[1] == '/')) {
-            continue;
+        if (line.empty()) continue;
+
+        std::istringstream ss(line);
+        std::string token1, token2;
+        if (!(ss >> token1)) continue;
+
+        char op = 'R';
+        std::string addrStr = token1;
+
+        if (ss >> token2) {
+            if (token1 == "W" || token1 == "w" || token1 == "WRITE" || token1 == "write" || token1 == "1" || token1 == "S") {
+                op = 'W';
+                addrStr = token2;
+            } else if (token1 == "R" || token1 == "r" || token1 == "READ" || token1 == "read" || token1 == "0" || token1 == "2" || token1 == "L") {
+                op = 'R';
+                addrStr = token2;
+            } else if (token2 == "W" || token2 == "w" || token2 == "WRITE" || token2 == "write" || token2 == "1" || token2 == "S") {
+                op = 'W';
+                addrStr = token1;
+            }
         }
 
-        std::istringstream lineStream(line);
-        std::string opStr, addrStr;
-        if (lineStream >> opStr >> addrStr) {
-            char op = std::toupper(opStr[0]);
-            if (op != 'R' && op != 'W') op = 'R';
-
-            uint64_t addr = 0;
-            try {
-                if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
-                    addr = std::stoull(addrStr, nullptr, 16);
-                } else {
-                    addr = std::stoull(addrStr, nullptr, 16);
-                }
-                entries.push_back({op, addr});
-            } catch (...) {}
-        }
+        try {
+            uint64_t addr = std::stoull(addrStr, nullptr, 16);
+            entries.push_back({op, addr});
+        } catch (...) {}
     }
     return entries;
 }
@@ -267,7 +277,7 @@ int main(int argc, char* argv[]) {
     char inspect_addr_str[64] = "0x1000";
 
     cache.configure(input_cache_size, input_block_size, input_associativity, ReplacementPolicy::LRU);
-    trace_entries = parseTraceText(trace_buffer);
+    loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
 
     bool running = true;
     while (running) {
@@ -550,7 +560,9 @@ int main(int argc, char* argv[]) {
         ImGui::Separator();
 
         ImGui::PushItemWidth(180);
-        ImGui::InputText("Trace Path", trace_file_path, IM_ARRAYSIZE(trace_file_path));
+        if (ImGui::InputText("Trace Path", trace_file_path, IM_ARRAYSIZE(trace_file_path), ImGuiInputTextFlags_EnterReturnsTrue)) {
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        }
         ImGui::PopItemWidth();
         
         ImGui::SameLine();
