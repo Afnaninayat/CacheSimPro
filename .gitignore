@@ -12,8 +12,4 @@ imgui.ini
 .vscode/
 .idea/
 
-# Internal / Preparation Guides (Ignored as requested)
-roman_urdu_project_guide.html
-roman_urdu_project_guide.md
-viva_preparation_guide.html
-viva_preparation_guide.md
+
