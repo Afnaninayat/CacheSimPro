@@ -51,7 +51,7 @@ static std::string OpenNativeFileDialogSync() {
     return filePath;
 }
 
-// Parse memory trace string into structured entries (Clean & Simple)
+// Parse memory trace string into structured entries (Clean & Robust)
 static std::vector<TraceEntry> parseTraceText(const std::string& text) {
     std::vector<TraceEntry> entries;
     std::istringstream stream(text);
@@ -61,6 +61,10 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         // Remove inline comments (#, //, ;)
         size_t c = line.find_first_of("#/;");
         if (c != std::string::npos) line = line.substr(0, c);
+
+        // Replace punctuation like commas and colons with spaces
+        std::replace(line.begin(), line.end(), ',', ' ');
+        std::replace(line.begin(), line.end(), ':', ' ');
 
         line = trim(line);
         if (line.empty()) continue;
@@ -73,20 +77,43 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         std::string addrStr = token1;
 
         if (ss >> token2) {
-            if (token1 == "W" || token1 == "w" || token1 == "WRITE" || token1 == "write" || token1 == "1" || token1 == "S") {
+            auto isW = [](const std::string& s) {
+                std::string u = s;
+                for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
+                return (u == "W" || u == "WRITE" || u == "1" || u == "S" || u == "STORE");
+            };
+            auto isR = [](const std::string& s) {
+                std::string u = s;
+                for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
+                return (u == "R" || u == "READ" || u == "0" || u == "2" || u == "L" || u == "LOAD" || u == "I" || u == "FETCH");
+            };
+
+            if (isW(token1)) {
                 op = 'W';
                 addrStr = token2;
-            } else if (token1 == "R" || token1 == "r" || token1 == "READ" || token1 == "read" || token1 == "0" || token1 == "2" || token1 == "L") {
+            } else if (isR(token1)) {
                 op = 'R';
                 addrStr = token2;
-            } else if (token2 == "W" || token2 == "w" || token2 == "WRITE" || token2 == "write" || token2 == "1" || token2 == "S") {
+            } else if (isW(token2)) {
                 op = 'W';
+                addrStr = token1;
+            } else if (isR(token2)) {
+                op = 'R';
                 addrStr = token1;
             }
         }
 
         try {
-            uint64_t addr = std::stoull(addrStr, nullptr, 16);
+            uint64_t addr = 0;
+            if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
+                addr = std::stoull(addrStr, nullptr, 16);
+            } else {
+                try {
+                    addr = std::stoull(addrStr, nullptr, 16);
+                } catch (...) {
+                    addr = std::stoull(addrStr, nullptr, 10);
+                }
+            }
             entries.push_back({op, addr});
         } catch (...) {}
     }
@@ -94,9 +121,16 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
 }
 
 static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_t buffer_size, std::vector<TraceEntry>& trace_entries, CacheCore& cache, size_t& current_step, std::vector<std::string>& execution_logs, std::string& status_message, bool& status_is_error) {
-    std::ifstream file(path);
+    std::string cleanPath = trim(path);
+    if (cleanPath.empty()) {
+        status_message = "Error: Please specify a valid trace file path.";
+        status_is_error = true;
+        return false;
+    }
+
+    std::ifstream file(cleanPath);
     if (!file.is_open()) {
-        std::string fullPath = "/home/cl4/Desktop/Afnaninayat/cache_simulator/" + path;
+        std::string fullPath = "/home/cl4/Desktop/Afnaninayat/cache_simulator/" + cleanPath;
         file.open(fullPath);
     }
 
@@ -115,11 +149,18 @@ static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_
         current_step = 0;
         cache.reset();
         execution_logs.clear();
-        status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions from file '" + path + "'.";
+
+        if (trace_entries.empty()) {
+            status_message = "Error: File '" + cleanPath + "' opened, but contained 0 valid trace instructions.";
+            status_is_error = true;
+            return false;
+        }
+
+        status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions from file '" + cleanPath + "'.";
         status_is_error = false;
         return true;
     } else {
-        status_message = "Error: Could not open trace file '" + path + "'.";
+        status_message = "Error: Could not open trace file '" + cleanPath + "'. Check file path.";
         status_is_error = true;
         return false;
     }
@@ -426,16 +467,23 @@ int main(int argc, char* argv[]) {
         ImGui::Separator();
 
         // Action Buttons
-        if (ImGui::Button("Run Simulation", ImVec2(140, 32))) {
+        auto ensureTraceLoaded = [&]() {
             if (trace_entries.empty()) {
                 trace_entries = parseTraceText(trace_buffer);
             }
+            if (trace_entries.empty() && trace_file_path[0] != '\0') {
+                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+            }
+        };
+
+        if (ImGui::Button("Run Simulation", ImVec2(140, 32))) {
+            ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
                 status_message = "Error: Please configure cache parameters first.";
                 status_is_error = true;
             } else if (trace_entries.empty()) {
-                status_message = "Error: Please load a trace file first.";
+                status_message = "Error: No valid trace instructions found. Load a trace file or enter instructions in the editor.";
                 status_is_error = true;
             } else {
                 current_step = 0;
@@ -457,15 +505,13 @@ int main(int argc, char* argv[]) {
         }
         ImGui::SameLine();
         if (ImGui::Button("Step", ImVec2(80, 32))) {
-            if (trace_entries.empty()) {
-                trace_entries = parseTraceText(trace_buffer);
-            }
+            ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
                 status_message = "Error: Please configure cache parameters first.";
                 status_is_error = true;
             } else if (trace_entries.empty()) {
-                status_message = "Error: Please load a trace file first.";
+                status_message = "Error: No valid trace instructions found. Load a trace file or enter instructions in the editor.";
                 status_is_error = true;
             } else {
                 if (current_step >= trace_entries.size()) {
@@ -493,15 +539,13 @@ int main(int argc, char* argv[]) {
             if (ImGui::Button("Pause", ImVec2(80, 32))) auto_play = false;
         } else {
             if (ImGui::Button("Auto Play", ImVec2(80, 32))) {
-                if (trace_entries.empty()) {
-                    trace_entries = parseTraceText(trace_buffer);
-                }
+                ensureTraceLoaded();
 
                 if (!cache.isConfigured()) {
                     status_message = "Error: Please configure cache parameters first.";
                     status_is_error = true;
                 } else if (trace_entries.empty()) {
-                    status_message = "Error: Please load a trace file first.";
+                    status_message = "Error: No valid trace instructions found. Load a trace file or enter instructions in the editor.";
                     status_is_error = true;
                 } else {
                     auto_play = true;
