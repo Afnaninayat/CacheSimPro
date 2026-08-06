@@ -1,4 +1,4 @@
-# Interactive Parameterized Cache Simulator (C++17 / Dear ImGui / Linux)
+# Interactive Parameterized Cache Simulator (C++ / Linux)
 
 A complete, production-ready interactive Parameterized Cache Simulator written in modern **C++17** using **Dear ImGui** (SDL2 + OpenGL3 backend) on Linux.
 
