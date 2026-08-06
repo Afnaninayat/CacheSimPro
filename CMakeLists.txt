@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(CacheSimulator CXX)
+project(CacheSimPro CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,20 +43,20 @@ set(IMGUI_SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
-add_executable(cache_simulator
+add_executable(CacheSimPro
     main.cpp
     CacheCore.hpp
     ${IMGUI_SOURCES}
 )
 
-target_include_directories(cache_simulator PRIVATE
+target_include_directories(CacheSimPro PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
     ${SDL2_SOURCE_DIR}/include
 )
 
-target_link_libraries(cache_simulator PRIVATE
+target_link_libraries(CacheSimPro PRIVATE
     SDL2::SDL2-static
     OpenGL::GL
     ${CMAKE_DL_LIBS}

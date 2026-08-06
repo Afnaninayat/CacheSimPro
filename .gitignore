@@ -6,6 +6,7 @@ bin/
 *.so
 *.out
 cache_simulator
+CacheSimPro
 
 # IDE / ImGui settings
 imgui.ini
