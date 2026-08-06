@@ -7,32 +7,18 @@
 #include "CacheCore.hpp"
 
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
-#include <bitset>
 #include <cstdio>
-#include <future>
-#include <filesystem>
-
-namespace fs = std::filesystem;
 
 struct TraceEntry {
     char op;
     uint64_t address;
 };
-
-// Global non-blocking native file dialog state
-static std::future<std::string> g_file_dialog_future;
-static bool g_file_dialog_pending = false;
-
-// Global ImGui File Picker Modal State
-static bool show_file_picker_modal = false;
-static std::string current_picker_dir = "/home/cl4/Desktop/Afnaninayat/cache_simulator";
 
 // Preset Configuration Options
 struct ValueOption {
@@ -75,22 +61,6 @@ static std::string trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-// Open Native Linux OS File Chooser Dialog (Zenity) synchronously in worker thread
-static std::string OpenNativeFileDialogSync() {
-    std::string filePath = "";
-    FILE* pipe = popen("zenity --file-selection --title=\"Select Memory Trace File\" 2>/dev/null", "r");
-    if (pipe) {
-        char buffer[2048];
-        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-            filePath = buffer;
-            filePath.erase(std::remove(filePath.begin(), filePath.end(), '\n'), filePath.end());
-            filePath.erase(std::remove(filePath.begin(), filePath.end(), '\r'), filePath.end());
-        }
-        pclose(pipe);
-    }
-    return filePath;
-}
-
 // Parse memory trace string into structured entries
 static std::vector<TraceEntry> parseTraceText(const std::string& text) {
     std::vector<TraceEntry> entries;
@@ -108,36 +78,60 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         if (line.empty()) continue;
 
         std::istringstream ss(line);
-        std::string token1, token2;
-        if (!(ss >> token1)) continue;
+        std::vector<std::string> tokens;
+        std::string tok;
+        while (ss >> tok) {
+            tokens.push_back(tok);
+        }
+        if (tokens.empty()) continue;
 
         char op = 'R';
-        std::string addrStr = token1;
+        std::string addrStr = "";
 
-        if (ss >> token2) {
-            auto isW = [](const std::string& s) {
-                std::string u = s;
-                for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
-                return (u == "W" || u == "WRITE" || u == "1" || u == "S" || u == "STORE");
-            };
-            auto isR = [](const std::string& s) {
-                std::string u = s;
-                for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
-                return (u == "R" || u == "READ" || u == "0" || u == "2" || u == "L" || u == "LOAD" || u == "I" || u == "FETCH");
-            };
+        auto isW = [](const std::string& s) {
+            std::string u = s;
+            for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
+            return (u == "W" || u == "WRITE" || u == "1" || u == "S" || u == "STORE");
+        };
 
-            if (isW(token1)) {
+        auto isR = [](const std::string& s) {
+            std::string u = s;
+            for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
+            return (u == "R" || u == "READ" || u == "0" || u == "2" || u == "L" || u == "LOAD" || u == "I" || u == "FETCH");
+        };
+
+        // First pass: look for token starting with 0x or 0X
+        for (const auto& t : tokens) {
+            if (t.find("0x") == 0 || t.find("0X") == 0) {
+                addrStr = t;
+                break;
+            }
+        }
+
+        // Second pass: look for token that is NOT an operation keyword
+        if (addrStr.empty()) {
+            for (const auto& t : tokens) {
+                if (!isW(t) && !isR(t)) {
+                    addrStr = t;
+                    break;
+                }
+            }
+        }
+
+        if (addrStr.empty()) {
+            addrStr = tokens[0];
+        }
+
+        // Find operation
+        for (const auto& t : tokens) {
+            if (t == addrStr) continue;
+            if (isW(t)) {
                 op = 'W';
-                addrStr = token2;
-            } else if (isR(token1)) {
+                break;
+            }
+            if (isR(t)) {
                 op = 'R';
-                addrStr = token2;
-            } else if (isW(token2)) {
-                op = 'W';
-                addrStr = token1;
-            } else if (isR(token2)) {
-                op = 'R';
-                addrStr = token1;
+                break;
             }
         }
 
@@ -146,9 +140,16 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
             if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
                 addr = std::stoull(addrStr, nullptr, 16);
             } else {
-                try {
+                bool has_hex = false;
+                for (char ch : addrStr) {
+                    if ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+                        has_hex = true;
+                        break;
+                    }
+                }
+                if (has_hex) {
                     addr = std::stoull(addrStr, nullptr, 16);
-                } catch (...) {
+                } else {
                     addr = std::stoull(addrStr, nullptr, 10);
                 }
             }
@@ -156,53 +157,6 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         } catch (...) {}
     }
     return entries;
-}
-
-static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_t buffer_size, std::vector<TraceEntry>& trace_entries, CacheCore& cache, size_t& current_step, std::vector<std::string>& execution_logs, std::string& status_message, bool& status_is_error) {
-    std::string cleanPath = trim(path);
-    if (cleanPath.empty()) {
-        status_message = "Error: Please specify a valid trace file path.";
-        status_is_error = true;
-        return false;
-    }
-
-    std::ifstream file(cleanPath);
-    if (!file.is_open()) {
-        std::string fullPath = "/home/cl4/Desktop/Afnaninayat/cache_simulator/" + cleanPath;
-        file.open(fullPath);
-    }
-
-    if (file.is_open()) {
-        std::stringstream ss;
-        ss << file.rdbuf();
-        std::string content = ss.str();
-        if (content.size() < buffer_size) {
-            std::copy(content.begin(), content.end(), trace_buffer);
-            trace_buffer[content.size()] = '\0';
-        } else {
-            std::copy(content.begin(), content.begin() + buffer_size - 1, trace_buffer);
-            trace_buffer[buffer_size - 1] = '\0';
-        }
-        trace_entries = parseTraceText(content);
-        current_step = 0;
-        cache.reset();
-        execution_logs.clear();
-        execution_logs.push_back("[Info] Loaded " + std::to_string(trace_entries.size()) + " trace instructions from '" + cleanPath + "'");
-
-        if (trace_entries.empty()) {
-            status_message = "Error: File '" + cleanPath + "' opened, but contained 0 valid trace instructions.";
-            status_is_error = true;
-            return false;
-        }
-
-        status_message = "Successfully loaded " + std::to_string(trace_entries.size()) + " instructions from '" + cleanPath + "'";
-        status_is_error = false;
-        return true;
-    } else {
-        status_message = "Error: Could not open trace file '" + cleanPath + "'. File does not exist.";
-        status_is_error = true;
-        return false;
-    }
 }
 
 // Format execution log entry
@@ -340,14 +294,14 @@ int main(int argc, char* argv[]) {
     int custom_block_size = 64;
     int custom_associativity = 4;
 
-    char trace_buffer[65536] = "";
-    char trace_file_path[256] = "trace.txt";
-    std::vector<TraceEntry> trace_entries;
+    char trace_buffer[65536] = "R 0x1000\nW 0x1004\nR 0x2000\nR 0x1000\nW 0x2004\nR 0x3000\n";
+    std::vector<TraceEntry> trace_entries = parseTraceText(trace_buffer);
     size_t current_step = 0;
 
     std::vector<std::string> execution_logs;
-    std::string status_message = "Ready. Select or load a trace file.";
+    std::string status_message = "Ready. Edit trace or click Run Simulation.";
     bool status_is_error = false;
+    (void)status_is_error;
 
     int active_set = -1;
     int active_way = -1;
@@ -371,9 +325,6 @@ int main(int argc, char* argv[]) {
     int init_bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
     int init_as = ASSOC_OPTIONS[assoc_idx].value;
     cache.configure(init_cs, init_bs, init_as, ReplacementPolicy::LRU);
-    
-    // Load default trace.txt at startup
-    loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
 
     bool running = true;
     while (running) {
@@ -385,19 +336,6 @@ int main(int argc, char* argv[]) {
                 running = false;
         }
 
-        // Non-blocking Native File Dialog Handler
-        if (g_file_dialog_pending && g_file_dialog_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-            std::string selectedFile = g_file_dialog_future.get();
-            g_file_dialog_pending = false;
-            if (!selectedFile.empty()) {
-                if (selectedFile.size() < sizeof(trace_file_path)) {
-                    std::copy(selectedFile.begin(), selectedFile.end(), trace_file_path);
-                    trace_file_path[selectedFile.size()] = '\0';
-                }
-                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-            }
-        }
-
         // Auto-play timer logic
         if (auto_play) {
             auto now = std::chrono::steady_clock::now();
@@ -405,9 +343,7 @@ int main(int argc, char* argv[]) {
             if (elapsed >= auto_play_speed_ms) {
                 last_step_time = now;
 
-                if (trace_entries.empty()) {
-                    trace_entries = parseTraceText(trace_buffer);
-                }
+                trace_entries = parseTraceText(trace_buffer);
 
                 if (!cache.isConfigured()) {
                     status_message = "Error: Please configure valid cache parameters first.";
@@ -465,7 +401,19 @@ int main(int argc, char* argv[]) {
         ImGui::SameLine();
         ImGui::TextDisabled("- Advanced Cache Simulator");
 
-        ImGui::SameLine(ImGui::GetWindowWidth() - 320.0f);
+        std::string statusText = "Status: " + status_message;
+        float statusWidth = ImGui::CalcTextSize(statusText.c_str()).x;
+        float headerWidth = ImGui::GetWindowWidth();
+        float centerPos = (headerWidth - statusWidth) * 0.5f;
+
+        ImGui::SameLine(std::max(260.0f, centerPos));
+        if (status_is_error) {
+            ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f), "%s", statusText.c_str());
+        } else {
+            ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.95f, 1.0f), "%s", statusText.c_str());
+        }
+
+        ImGui::SameLine(ImGui::GetWindowWidth() - 220.0f);
         if (auto_play) {
             ImGui::TextColored(ImVec4(0.00f, 0.90f, 0.45f, 1.0f), "[AUTO-PLAY ACTIVE]");
         } else if (current_step > 0 && current_step >= trace_entries.size()) {
@@ -473,9 +421,6 @@ int main(int argc, char* argv[]) {
         } else {
             ImGui::TextDisabled("[STANDBY READY]");
         }
-
-        ImGui::SameLine();
-        ImGui::TextDisabled("  |  [Config]");
         ImGui::EndChild();
 
         // =========================================================
@@ -495,7 +440,7 @@ int main(int argc, char* argv[]) {
         // ---------------------------------------------------------
         
         // 1. Configuration Panel (Top Left)
-        ImGui::BeginChild("ConfigPanel", ImVec2(0, 310), true);
+        ImGui::BeginChild("ConfigPanel", ImVec2(0, 350), true);
         ImGui::TextColored(ImVec4(0.92f, 0.95f, 0.98f, 1.00f), "Configuration");
         ImGui::Separator();
 
@@ -507,17 +452,22 @@ int main(int argc, char* argv[]) {
         }
         ImGui::SameLine();
         if (ImGui::RadioButton("Custom", config_mode == 1)) {
-            config_mode = 1;
+            if (config_mode != 1) {
+                config_mode = 1;
+                custom_cache_size = CACHE_SIZE_OPTIONS[cache_size_idx].value;
+                custom_block_size = BLOCK_SIZE_OPTIONS[block_size_idx].value;
+                custom_associativity = ASSOC_OPTIONS[assoc_idx].value;
+            }
         }
 
         ImGui::Spacing();
 
         if (config_mode == 0) {
-            // Dropdown Mode matching mockup
+            // Dropdown Mode
             ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
             
             const char* cs_labels[] = { "256 Bytes", "512 Bytes", "1 KB", "2 KB", "4 KB", "8 KB", "16 KB", "64 KB" };
-            if (ImGui::Combo("Cache Size (KB)", &cache_size_idx, cs_labels, IM_ARRAYSIZE(cs_labels))) {
+            if (ImGui::Combo("Cache Size", &cache_size_idx, cs_labels, IM_ARRAYSIZE(cs_labels))) {
                 int cs = CACHE_SIZE_OPTIONS[cache_size_idx].value;
                 int bs = BLOCK_SIZE_OPTIONS[block_size_idx].value;
                 int as = ASSOC_OPTIONS[assoc_idx].value;
@@ -530,6 +480,8 @@ int main(int argc, char* argv[]) {
                     status_is_error = false;
                     execution_logs.clear();
                     current_step = 0;
+                    active_set = -1;
+                    active_way = -1;
                 }
             }
 
@@ -547,6 +499,8 @@ int main(int argc, char* argv[]) {
                     status_is_error = false;
                     execution_logs.clear();
                     current_step = 0;
+                    active_set = -1;
+                    active_way = -1;
                 }
             }
 
@@ -564,6 +518,8 @@ int main(int argc, char* argv[]) {
                     status_is_error = false;
                     execution_logs.clear();
                     current_step = 0;
+                    active_set = -1;
+                    active_way = -1;
                 }
             }
 
@@ -598,6 +554,8 @@ int main(int argc, char* argv[]) {
                     status_is_error = false;
                     execution_logs.clear();
                     current_step = 0;
+                    active_set = -1;
+                    active_way = -1;
                 }
             }
         }
@@ -606,38 +564,42 @@ int main(int argc, char* argv[]) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        // Button Toolbar Bar matching Mockup exactly
+        // Toolbar Buttons (Load Trace, Run Simulation, Step, Auto Play, Reset)
         auto ensureTraceLoaded = [&]() {
-            if (trace_entries.empty()) {
-                trace_entries = parseTraceText(trace_buffer);
-            }
-            if (trace_entries.empty() && trace_file_path[0] != '\0') {
-                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-            }
+            trace_entries = parseTraceText(trace_buffer);
         };
 
         float avail_w = ImGui::GetContentRegionAvail().x;
-        float btn_w = (avail_w - 24.0f) / 4.0f;
+        float item_spacing = ImGui::GetStyle().ItemSpacing.x;
+        float btn_w = (avail_w - (item_spacing * 4.0f)) / 5.0f;
 
-        // Load Trace Button (Blue) -> Loads file if specified, else opens picker
+        // 1. Load Trace Button (Blue) -> Parses user-entered trace instructions
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.62f, 0.98f, 1.0f));
-        if (ImGui::Button(" Load Trace ", ImVec2(btn_w, 34))) {
-            if (strlen(trace_file_path) > 0 && fs::exists(trace_file_path)) {
-                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        if (ImGui::Button("Load Trace", ImVec2(btn_w, 34))) {
+            trace_entries = parseTraceText(trace_buffer);
+            current_step = 0;
+            cache.reset();
+            execution_logs.clear();
+            active_set = -1;
+            active_way = -1;
+            auto_play = false;
+            if (trace_entries.empty()) {
+                status_message = "Error: Trace editor is empty. Please enter memory instructions.";
+                status_is_error = true;
             } else {
-                show_file_picker_modal = true;
-                g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
-                g_file_dialog_pending = true;
+                status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions.";
+                status_is_error = false;
+                execution_logs.push_back("[Info] Loaded " + std::to_string(trace_entries.size()) + " user trace instructions.");
             }
         }
         ImGui::PopStyleColor(2);
 
-        // Run Simulation Button (Emerald Green)
+        // 2. Run Simulation Button (Emerald Green)
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.78f, 0.38f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.00f, 0.90f, 0.45f, 1.0f));
-        if (ImGui::Button(" Run Simulation ", ImVec2(btn_w + 20.0f, 34))) {
+        if (ImGui::Button("Run Sim", ImVec2(btn_w, 34))) {
             ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
@@ -667,10 +629,10 @@ int main(int argc, char* argv[]) {
         }
         ImGui::PopStyleColor(2);
 
-        // Step Button
+        // 3. Step Button
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
-        if (ImGui::Button(" Step ", ImVec2(btn_w - 10.0f, 34))) {
+        if (ImGui::Button("Step", ImVec2(btn_w, 34))) {
             ensureTraceLoaded();
 
             if (!cache.isConfigured()) {
@@ -703,10 +665,42 @@ int main(int argc, char* argv[]) {
         }
         ImGui::PopStyleColor();
 
-        // Reset Button
+        // 4. Auto Play / Pause Toggle Button
+        ImGui::SameLine();
+        if (auto_play) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.85f, 0.40f, 0.10f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.95f, 0.50f, 0.15f, 1.0f));
+            if (ImGui::Button("Pause", ImVec2(btn_w, 34))) {
+                auto_play = false;
+                status_message = "Auto-play paused.";
+                status_is_error = false;
+            }
+            ImGui::PopStyleColor(2);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.55f, 0.45f, 1.0f));
+            if (ImGui::Button("Auto Play", ImVec2(btn_w, 34))) {
+                ensureTraceLoaded();
+                if (!cache.isConfigured()) {
+                    status_message = "Error: Configure cache parameters first.";
+                    status_is_error = true;
+                } else if (trace_entries.empty()) {
+                    status_message = "Error: Memory trace is empty.";
+                    status_is_error = true;
+                } else {
+                    auto_play = true;
+                    last_step_time = std::chrono::steady_clock::now();
+                    status_message = "Auto-play started.";
+                    status_is_error = false;
+                }
+            }
+            ImGui::PopStyleColor(2);
+        }
+
+        // 5. Reset Button
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
-        if (ImGui::Button(" Reset ", ImVec2(btn_w - 10.0f, 34))) {
+        if (ImGui::Button("Reset", ImVec2(btn_w, 34))) {
             cache.reset();
             trace_entries = parseTraceText(trace_buffer);
             execution_logs.clear();
@@ -728,29 +722,6 @@ int main(int argc, char* argv[]) {
         ImGui::TextDisabled("...");
         ImGui::Separator();
 
-        // Direct File Path Input + Load File Button + Browse Dialog Button
-        ImGui::TextDisabled("Trace File:");
-        ImGui::SameLine();
-        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 170.0f);
-        if (ImGui::InputText("##TraceFilePathInput", trace_file_path, IM_ARRAYSIZE(trace_file_path), ImGuiInputTextFlags_EnterReturnsTrue)) {
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-        ImGui::PopItemWidth();
-
-        ImGui::SameLine();
-        if (ImGui::Button(" Load File ")) {
-            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button(" Browse... ")) {
-            show_file_picker_modal = true;
-            g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
-            g_file_dialog_pending = true;
-        }
-
-        ImGui::Separator();
-
         // Quick Instruction Entry Form
         ImGui::TextDisabled("Add Instruction:");
         ImGui::SameLine();
@@ -766,11 +737,16 @@ int main(int argc, char* argv[]) {
 
         ImGui::SameLine();
         if (ImGui::Button(" Add ")) {
-            std::string lineStr = std::string(quick_op_idx == 0 ? "R " : "W ") + quick_addr_input + "\n";
-            size_t currentLen = strlen(trace_buffer);
-            if (currentLen + lineStr.size() < sizeof(trace_buffer)) {
-                strcat(trace_buffer, lineStr.c_str());
-                trace_entries = parseTraceText(trace_buffer);
+            std::string addrTrimmed = trim(quick_addr_input);
+            if (!addrTrimmed.empty()) {
+                std::string lineStr = std::string(quick_op_idx == 0 ? "R " : "W ") + addrTrimmed + "\n";
+                size_t currentLen = strlen(trace_buffer);
+                if (currentLen + lineStr.size() < sizeof(trace_buffer)) {
+                    strcat(trace_buffer, lineStr.c_str());
+                    trace_entries = parseTraceText(trace_buffer);
+                    status_message = "Added instruction: " + trim(lineStr);
+                    status_is_error = false;
+                }
             }
         }
 
@@ -779,8 +755,13 @@ int main(int argc, char* argv[]) {
             trace_buffer[0] = '\0';
             trace_entries.clear();
             current_step = 0;
+            active_set = -1;
+            active_way = -1;
             cache.reset();
             execution_logs.clear();
+            auto_play = false;
+            status_message = "Trace editor and cache state cleared.";
+            status_is_error = false;
         }
 
         ImGui::Spacing();
@@ -788,7 +769,7 @@ int main(int argc, char* argv[]) {
         // Line numbers gutter + Monospaced text area split
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 0.0f));
         
-        float full_avail_y = ImGui::GetContentRegionAvail().y - 20.0f;
+        float full_avail_y = std::max(100.0f, ImGui::GetContentRegionAvail().y - 24.0f);
         
         // Line Gutter Panel
         ImGui::BeginChild("LineGutter", ImVec2(38, full_avail_y), false, ImGuiWindowFlags_NoScrollbar);
@@ -816,7 +797,7 @@ int main(int argc, char* argv[]) {
         }
         ImGui::PopStyleVar();
 
-        ImGui::TextDisabled("Trace Count: %zu instructions | File: %s", trace_entries.size(), trace_file_path);
+        ImGui::TextDisabled("Trace Count: %zu instructions", trace_entries.size());
 
         ImGui::EndChild();
 
@@ -1001,71 +982,12 @@ int main(int argc, char* argv[]) {
 
         ImGui::EndChild();
 
-        // =========================================================
-        // IN-APP FILE SELECTOR POPUP MODAL
-        // =========================================================
-        if (show_file_picker_modal) {
-            ImGui::OpenPopup("Select Memory Trace File");
-        }
-        ImGui::SetNextWindowSize(ImVec2(640, 420), ImGuiCond_FirstUseEver);
-        if (ImGui::BeginPopupModal("Select Memory Trace File", &show_file_picker_modal)) {
-            ImGui::TextDisabled("Current Directory:");
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.00f, 0.85f, 0.95f, 1.0f), "%s", current_picker_dir.c_str());
-            ImGui::Separator();
-
-            ImGui::BeginChild("FileListRegion", ImVec2(0, 300), true);
-            try {
-                if (ImGui::Selectable(" [..]  Up to Parent Directory")) {
-                    current_picker_dir = fs::path(current_picker_dir).parent_path().string();
-                }
-                ImGui::Separator();
-
-                std::vector<fs::directory_entry> dirs;
-                std::vector<fs::directory_entry> files;
-                for (const auto& entry : fs::directory_iterator(current_picker_dir)) {
-                    if (entry.is_directory()) dirs.push_back(entry);
-                    else files.push_back(entry);
-                }
-
-                std::sort(dirs.begin(), dirs.end(), [](const auto& a, const auto& b){ return a.path().filename() < b.path().filename(); });
-                std::sort(files.begin(), files.end(), [](const auto& a, const auto& b){ return a.path().filename() < b.path().filename(); });
-
-                for (const auto& dirEntry : dirs) {
-                    std::string label = " [DIR]  " + dirEntry.path().filename().string();
-                    if (ImGui::Selectable(label.c_str())) {
-                        current_picker_dir = dirEntry.path().string();
-                    }
-                }
-
-                for (const auto& fileEntry : files) {
-                    std::string fname = fileEntry.path().filename().string();
-                    std::string label = "  [FILE] " + fname;
-                    if (ImGui::Selectable(label.c_str())) {
-                        std::string fullPath = fileEntry.path().string();
-                        snprintf(trace_file_path, sizeof(trace_file_path), "%s", fullPath.c_str());
-                        loadTraceFromFile(fullPath, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
-                        show_file_picker_modal = false;
-                        ImGui::CloseCurrentPopup();
-                    }
-                }
-            } catch (const std::exception& ex) {
-                ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Cannot list directory: %s", ex.what());
-            }
-            ImGui::EndChild();
-
-            ImGui::Separator();
-            if (ImGui::Button(" Cancel ", ImVec2(120, 30))) {
-                show_file_picker_modal = false;
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
-
         ImGui::End();
 
         ImGui::Render();
-        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
+        int display_w, display_h;
+        SDL_GL_GetDrawableSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
         glClearColor(0.07f, 0.09f, 0.12f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
