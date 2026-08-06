@@ -16,11 +16,16 @@
 #include <chrono>
 #include <bitset>
 #include <cstdio>
+#include <future>
 
 struct TraceEntry {
     char op;
     uint64_t address;
 };
+
+// Global non-blocking native file dialog state
+static std::future<std::string> g_file_dialog_future;
+static bool g_file_dialog_pending = false;
 
 // Helper: Trim leading and trailing whitespace
 static std::string trim(const std::string& str) {
@@ -30,8 +35,8 @@ static std::string trim(const std::string& str) {
     return str.substr(first, (last - first + 1));
 }
 
-// Open Native Linux OS File Chooser Dialog (Zenity)
-static std::string OpenNativeFileDialog() {
+// Open Native Linux OS File Chooser Dialog (Zenity) synchronously in worker thread
+static std::string OpenNativeFileDialogSync() {
     std::string filePath = "";
     FILE* pipe = popen("zenity --file-selection --title=\"Select Memory Trace File\" --file-filter=\"Trace Files (*.txt *.trace) | *.txt *.trace\" --file-filter=\"All Files | *\" 2>/dev/null", "r");
     if (pipe) {
@@ -76,6 +81,38 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         }
     }
     return entries;
+}
+
+static bool loadTraceFromFile(const std::string& path, char* trace_buffer, size_t buffer_size, std::vector<TraceEntry>& trace_entries, CacheCore& cache, size_t& current_step, std::vector<std::string>& execution_logs, std::string& status_message, bool& status_is_error) {
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::string fullPath = "/home/cl4/Desktop/Afnaninayat/cache_simulator/" + path;
+        file.open(fullPath);
+    }
+
+    if (file.is_open()) {
+        std::stringstream ss;
+        ss << file.rdbuf();
+        std::string content = ss.str();
+        if (content.size() < buffer_size) {
+            std::copy(content.begin(), content.end(), trace_buffer);
+            trace_buffer[content.size()] = '\0';
+        } else {
+            std::copy(content.begin(), content.begin() + buffer_size - 1, trace_buffer);
+            trace_buffer[buffer_size - 1] = '\0';
+        }
+        trace_entries = parseTraceText(content);
+        current_step = 0;
+        cache.reset();
+        execution_logs.clear();
+        status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions from file '" + path + "'.";
+        status_is_error = false;
+        return true;
+    } else {
+        status_message = "Error: Could not open trace file '" + path + "'.";
+        status_is_error = true;
+        return false;
+    }
 }
 
 // Format execution log matching exact USTP specification
@@ -512,50 +549,54 @@ int main(int argc, char* argv[]) {
         ImGui::TextColored(ImVec4(0.35f, 0.75f, 1.00f, 1.00f), "TRACE EDITOR PANEL");
         ImGui::Separator();
 
-        ImGui::PushItemWidth(220);
-        ImGui::InputText("Trace File", trace_file_path, IM_ARRAYSIZE(trace_file_path));
+        ImGui::PushItemWidth(180);
+        ImGui::InputText("Trace Path", trace_file_path, IM_ARRAYSIZE(trace_file_path));
         ImGui::PopItemWidth();
         
         ImGui::SameLine();
-        if (ImGui::Button("Load Trace...")) {
-            std::string selectedFile = OpenNativeFileDialog();
+        if (ImGui::Button("Load Path")) {
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        }
+
+        ImGui::SameLine();
+        if (g_file_dialog_pending) {
+            ImGui::Button("Browsing...", ImVec2(90, 0));
+        } else {
+            if (ImGui::Button("Browse...")) {
+                g_file_dialog_future = std::async(std::launch::async, OpenNativeFileDialogSync);
+                g_file_dialog_pending = true;
+            }
+        }
+
+        // Non-blocking async result processing
+        if (g_file_dialog_pending && g_file_dialog_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+            std::string selectedFile = g_file_dialog_future.get();
+            g_file_dialog_pending = false;
             if (!selectedFile.empty()) {
                 if (selectedFile.size() < sizeof(trace_file_path)) {
                     std::copy(selectedFile.begin(), selectedFile.end(), trace_file_path);
                     trace_file_path[selectedFile.size()] = '\0';
                 }
+                loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
             }
-            
-            std::ifstream file(trace_file_path);
-            if (!file.is_open()) {
-                std::string fullPath = "/home/cl4/Desktop/Afnaninayat/cache_simulator/" + std::string(trace_file_path);
-                file.open(fullPath);
-            }
+        }
 
-            if (file.is_open()) {
-                std::stringstream ss;
-                ss << file.rdbuf();
-                std::string content = ss.str();
-                if (content.size() < sizeof(trace_buffer)) {
-                    std::copy(content.begin(), content.end(), trace_buffer);
-                    trace_buffer[content.size()] = '\0';
-                }
-                trace_entries = parseTraceText(content);
-                current_step = 0;
-                cache.reset();
-                execution_logs.clear();
-                status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions from file '" + std::string(trace_file_path) + "'.";
-                status_is_error = false;
-            } else {
-                trace_entries = parseTraceText(trace_buffer);
-                if (!trace_entries.empty()) {
-                    status_message = "Parsed trace editor text (" + std::to_string(trace_entries.size()) + " instructions).";
-                    status_is_error = false;
-                } else {
-                    status_message = "Error: Please load a trace file first.";
-                    status_is_error = true;
-                }
-            }
+        // Quick Preset Trace File Selectors
+        ImGui::TextDisabled("Quick Presets:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace.txt")) {
+            snprintf(trace_file_path, sizeof(trace_file_path), "trace.txt");
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace_loop.txt")) {
+            snprintf(trace_file_path, sizeof(trace_file_path), "trace_loop.txt");
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace_thrash.txt")) {
+            snprintf(trace_file_path, sizeof(trace_file_path), "trace_thrash.txt");
+            loadTraceFromFile(trace_file_path, trace_buffer, sizeof(trace_buffer), trace_entries, cache, current_step, execution_logs, status_message, status_is_error);
         }
 
         ImGui::TextDisabled("Memory Trace Text (Format: [Op] [Hex Address]):");
