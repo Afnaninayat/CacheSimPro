@@ -173,7 +173,7 @@ static std::string formatLogEntry(const StepResult& res) {
     return ss.str();
 }
 
-static void ApplySimCacheTheme() {
+static void ApplyCacheSimProTheme() {
     ImGuiStyle& style = ImGui::GetStyle();
     
     style.WindowPadding     = ImVec2(14.0f, 14.0f);
@@ -266,7 +266,7 @@ int main(int argc, char* argv[]) {
     }
 
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window* window = SDL_CreateWindow("SimCache Pro - Advanced Cache Simulator", 
+    SDL_Window* window = SDL_CreateWindow("CacheSimPro - Advanced Cache Simulator", 
                                           SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
                                           target_w, target_h, window_flags);
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
@@ -278,7 +278,7 @@ int main(int argc, char* argv[]) {
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    ApplySimCacheTheme();
+    ApplyCacheSimProTheme();
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
@@ -397,7 +397,7 @@ int main(int argc, char* argv[]) {
         ImGui::SetCursorPosY(10.0f);
         
         // Brand Badge Icon & Title
-        ImGui::TextColored(ImVec4(0.12f, 0.58f, 0.95f, 1.00f), "  SimCache Pro");
+        ImGui::TextColored(ImVec4(0.12f, 0.58f, 0.95f, 1.00f), "  CacheSimPro");
         ImGui::SameLine();
         ImGui::TextDisabled("- Advanced Cache Simulator");
 
