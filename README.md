@@ -1,36 +1,56 @@
-# Interactive Parameterized Cache Simulator (C++ / Linux)
+# CacheSimPro - Advanced Cache Simulator
 
-A complete, production-ready interactive Parameterized Cache Simulator written in modern **C++17** using **Dear ImGui** (SDL2 + OpenGL3 backend) on Linux.
+![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
+![Build](https://img.shields.io/badge/Build-CMake-brightgreen.svg)
+![GUI](https://img.shields.io/badge/GUI-Dear%20ImGui%20%2B%20SDL2-orange.svg)
 
-## Features
+**CacheSimPro** is a modern, high-performance graphical Cache Architecture Simulator written in **C++17** using **SDL2**, **OpenGL3**, and **Dear ImGui**. It provides real-time visualization of cache hits, misses, evictions, dirty line tracking, and detailed set/way state inspection.
 
-- **Parameterized Cache Configurations**:
-  - Total Cache Size (Bytes)
-  - Block Size (Bytes)
-  - Associativity ($n$-way set associative, direct-mapped, or fully associative)
-  - Strictly enforces power-of-2 validation for all cache parameters.
+---
+
+## Key Features
+
+- **Flexible Cache Architecture Setup**:
+  - **Cache Sizes**: 256 B, 512 B, 1 KB, 2 KB, 4 KB, 8 KB, 16 KB, 64 KB (and custom power-of-2 sizes).
+  - **Block Sizes**: 16 B, 32 B, 64 B, 128 B, 256 B.
+  - **Associativity**: Direct-Mapped (1-Way), 2-Way, 4-Way, 8-Way, 16-Way Set Associative.
+  - Strict power-of-two bitwise parameter validation.
 - **Replacement Policies**:
   - **LRU** (Least Recently Used)
   - **FIFO** (First-In, First-Out)
-  - **Random**
-- **Trace Management & Parsing**:
-  - Load trace files from disk or edit directly via the interactive multi-line text editor.
-  - Formats supported: `R 0x1000`, `W 0x1004`, `r 1008` (ignoring blank lines and `#` / `//` comments).
-- **Visualization & Real-Time Dashboard**:
-  - **Statistics Dashboard**: Live tracking of Hits, Misses, Evictions, Hit Rate %, and Miss Rate %.
-  - **Interactive Visualizer Grid**: Matrix of Sets $\times$ Ways displaying Valid bit ($V$) and Tag in hexadecimal.
-  - **Cell Highlighting**:
-    - **Green**: Active Hit line
-    - **Yellow**: Active Miss (allocated into an empty line)
-    - **Red**: Active Eviction (replaced valid line in a full set)
-  - **Step-by-step Execution Log**: Scrollable real-time history log formatted as:
-    `Address <0xHEX> -> Set <INDEX>, Tag <0xTAG> -> <HIT | MISS | MISS (Evicted Line <WAY>)>`
+  - **Random** (`std::uniform_int_distribution<uint32_t>`)
+- **Robust Line-by-Line Memory Trace Parser**:
+  - Validates memory operations (`R`, `W`, `READ`, `WRITE`, `LOAD`, `STORE`, `FETCH`).
+  - Validates hexadecimal (`0x1000`) and decimal memory addresses.
+  - Supports `,` and `:` separators (`R,0x1000`, `W:0x1004`).
+  - Ignores blank lines and comments (`#`, `//`, `;`).
+  - Reports exact line numbers for syntax errors (e.g. `Line 3: Invalid operation 'HELLO'. Use R or W.`, `Line 2: Invalid address 'XYZ'`).
+- **Disk File Loading & Presets**:
+  - Load custom `.txt` trace files via disk path input (`Trace File:`).
+  - One-click preset buttons: `memory_trace.txt`, `trace.txt`, `trace_loop.txt`, `trace_thrash.txt`.
+- **Interactive Multi-Line Trace Editor**:
+  - Direct text editing with line-number gutter.
+  - Quick instruction entry form (`Add Instruction`).
+  - Interactive validation alerts.
+- **Simulation Control Engine**:
+  - **Run Sim**: Executes complete trace in batch.
+  - **Step**: Step-by-step single-instruction execution.
+  - **Auto Play / Pause**: Automated trace execution with configurable speed timer.
+  - **Reset**: Resets cache state, line valid/dirty bits, and counters without wiping cache parameters.
+- **Real-Time Visualization & Metrics**:
+  - Dashboard cards: **Cache Hits**, **Cache Misses**, **Evictions**, **Hit Rate %**, and **Total Accesses**.
+  - Interactive **Cache Set $\times$ Way Grid Matrix** displaying Valid bit (`V`), Tag (`Tag:0xHEX`), and hover tooltips for timestamps.
+  - Cell status color coding:
+    - **Emerald Green**: Active Hit line
+    - **Orange / Red**: Active Eviction / Miss
+    - **Electric Blue**: Valid Loaded Cache Line
+  - **Execution Log Console**: Real-time access history with explicit `(Dirty eviction)` tracking.
 
 ---
 
 ## Build Prerequisites (Linux)
 
-Ensure you have CMake, a C++17 compliant compiler (`g++` or `clang++`), and OpenGL headers installed:
+Ensure you have CMake, a C++17 compiler (`g++` or `clang++`), and OpenGL development headers installed:
 
 ```bash
 # Ubuntu / Debian
@@ -45,43 +65,38 @@ sudo apt install build-essential cmake libgl1-mesa-dev
 ## Building and Running
 
 ```bash
-# 1. Generate build directory
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+# 1. Generate build files
+cmake -B build -S .
 
 # 2. Compile binary
 cmake --build build -j$(nproc)
 
-# 3. Launch Cache Simulator
-./build/cache_simulator
+# 3. Launch CacheSimPro
+./build/CacheSimPro
 ```
 
 ---
 
-## Sample Trace File
+## Canonical Trace File Format
 
-Create a file named `trace.txt` or paste the following into the Trace Editor:
+Memory trace files contain memory access instructions formatted as `<Operation> <Address>`:
 
 ```text
 # Sample Memory Trace
 R 0x1000
-R 0x1004
-W 0x1008
+W 0x1004
 R 0x2000
-R 0x3000
-R 0x4000
-R 0x5000
 R 0x1000
 W 0x2004
-R 0x6000
+R 0x3000
+R 0x1000
+W 0x3004
+R 0x4000
+R 0x1004
 ```
 
 ---
 
-## Validation Error Handling
+## License
 
-- Clicking **"Run Simulation"** or **"Step"** without configuring cache shows:  
-  `Error: Please configure cache parameters first.`
-- Clicking **"Run Simulation"** or **"Step"** with no trace loaded shows:  
-  `Error: Please load a trace file first.`
-- Configuring invalid non-power-of-2 parameters shows:  
-  `Error: Invalid cache configuration! Size, Block, and Associativity must be powers of 2.`
+This project is open source and available under the [MIT License](LICENSE).
