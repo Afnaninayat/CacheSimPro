@@ -7,6 +7,7 @@
 #include "CacheCore.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -14,10 +15,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cctype>
 
 struct TraceEntry {
     char op;
     uint64_t address;
+};
+
+struct ParseResult {
+    bool valid = true;
+    std::string error_message;
+    int error_line = -1;
+    std::vector<TraceEntry> entries;
 };
 
 // Preset Configuration Options
@@ -57,25 +66,41 @@ static const ValueOption ASSOC_OPTIONS[] = {
 static std::string trim(const std::string& str) {
     size_t first = str.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) return "";
-    size_t last = str.find_last_of(" \t\r\n");
+    size_t last = str.find_last_not_of(" \t\r\n");
     return str.substr(first, (last - first + 1));
 }
 
-// Parse memory trace string into structured entries
-static std::vector<TraceEntry> parseTraceText(const std::string& text) {
-    std::vector<TraceEntry> entries;
+// Parse memory trace string into structured entries with full line-by-line validation
+static ParseResult parseTraceTextEx(const std::string& text) {
+    ParseResult res;
+    if (trim(text).empty()) {
+        res.valid = false;
+        res.error_message = "Trace file is empty.";
+        return res;
+    }
+
     std::istringstream stream(text);
-    std::string line;
+    std::string raw_line;
+    int line_num = 0;
 
-    while (std::getline(stream, line)) {
-        size_t c = line.find_first_of("#/;");
-        if (c != std::string::npos) line = line.substr(0, c);
+    while (std::getline(stream, raw_line)) {
+        line_num++;
+        std::string line = raw_line;
 
+        // Strip comments starting with #, //, ;
+        size_t c1 = line.find('#');
+        if (c1 != std::string::npos) line = line.substr(0, c1);
+        size_t c2 = line.find("//");
+        if (c2 != std::string::npos) line = line.substr(0, c2);
+        size_t c3 = line.find(';');
+        if (c3 != std::string::npos) line = line.substr(0, c3);
+
+        // Replace separators ',' and ':' with spaces
         std::replace(line.begin(), line.end(), ',', ' ');
         std::replace(line.begin(), line.end(), ':', ' ');
 
         line = trim(line);
-        if (line.empty()) continue;
+        if (line.empty()) continue; // blank line or full line comment
 
         std::istringstream ss(line);
         std::vector<std::string> tokens;
@@ -85,78 +110,120 @@ static std::vector<TraceEntry> parseTraceText(const std::string& text) {
         }
         if (tokens.empty()) continue;
 
+        std::string opToken = tokens[0];
+        std::transform(opToken.begin(), opToken.end(), opToken.begin(), [](unsigned char c) { return std::toupper(c); });
+
         char op = 'R';
-        std::string addrStr = "";
-
-        auto isW = [](const std::string& s) {
-            std::string u = s;
-            for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
-            return (u == "W" || u == "WRITE" || u == "1" || u == "S" || u == "STORE");
-        };
-
-        auto isR = [](const std::string& s) {
-            std::string u = s;
-            for (char &ch : u) ch = std::toupper(static_cast<unsigned char>(ch));
-            return (u == "R" || u == "READ" || u == "0" || u == "2" || u == "L" || u == "LOAD" || u == "I" || u == "FETCH");
-        };
-
-        // First pass: look for token starting with 0x or 0X
-        for (const auto& t : tokens) {
-            if (t.find("0x") == 0 || t.find("0X") == 0) {
-                addrStr = t;
-                break;
-            }
+        if (opToken == "R" || opToken == "READ" || opToken == "LOAD" || opToken == "FETCH" || opToken == "L" || opToken == "I" || opToken == "0" || opToken == "2") {
+            op = 'R';
+        } else if (opToken == "W" || opToken == "WRITE" || opToken == "STORE" || opToken == "S" || opToken == "1") {
+            op = 'W';
+        } else {
+            res.valid = false;
+            res.error_message = "Line " + std::to_string(line_num) + ": Invalid operation '" + tokens[0] + "'. Use R or W.";
+            res.error_line = line_num;
+            res.entries.clear();
+            return res;
         }
 
-        // Second pass: look for token that is NOT an operation keyword
-        if (addrStr.empty()) {
-            for (const auto& t : tokens) {
-                if (!isW(t) && !isR(t)) {
-                    addrStr = t;
+        if (tokens.size() < 2) {
+            res.valid = false;
+            res.error_message = "Line " + std::to_string(line_num) + ": Expected format: R 0x1000 or W 0x1000";
+            res.error_line = line_num;
+            res.entries.clear();
+            return res;
+        }
+
+        std::string addrStr = tokens[1];
+        uint64_t addr = 0;
+        int base = 10;
+        if (addrStr.rfind("0x", 0) == 0 || addrStr.rfind("0X", 0) == 0) {
+            base = 16;
+        } else {
+            bool has_hex_char = false;
+            for (char c : addrStr) {
+                if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+                    has_hex_char = true;
                     break;
                 }
             }
-        }
-
-        if (addrStr.empty()) {
-            addrStr = tokens[0];
-        }
-
-        // Find operation
-        for (const auto& t : tokens) {
-            if (t == addrStr) continue;
-            if (isW(t)) {
-                op = 'W';
-                break;
-            }
-            if (isR(t)) {
-                op = 'R';
-                break;
-            }
+            if (has_hex_char) base = 16;
         }
 
         try {
-            uint64_t addr = 0;
-            if (addrStr.find("0x") == 0 || addrStr.find("0X") == 0) {
-                addr = std::stoull(addrStr, nullptr, 16);
-            } else {
-                bool has_hex = false;
-                for (char ch : addrStr) {
-                    if ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
-                        has_hex = true;
-                        break;
-                    }
-                }
-                if (has_hex) {
-                    addr = std::stoull(addrStr, nullptr, 16);
-                } else {
-                    addr = std::stoull(addrStr, nullptr, 10);
-                }
+            size_t processed = 0;
+            addr = std::stoull(addrStr, &processed, base);
+            if (processed != addrStr.size()) {
+                res.valid = false;
+                res.error_message = "Line " + std::to_string(line_num) + ": Invalid address '" + addrStr + "'.";
+                res.error_line = line_num;
+                res.entries.clear();
+                return res;
             }
-            entries.push_back({op, addr});
-        } catch (...) {}
+        } catch (...) {
+            res.valid = false;
+            res.error_message = "Line " + std::to_string(line_num) + ": Invalid address '" + addrStr + "'.";
+            res.error_line = line_num;
+            res.entries.clear();
+            return res;
+        }
+
+        res.entries.push_back({op, addr});
     }
-    return entries;
+
+    if (res.entries.empty()) {
+        res.valid = false;
+        res.error_message = "Trace file is empty.";
+    }
+
+    return res;
+}
+
+
+// Load trace from disk file
+static bool loadTraceFile(const std::string& filepath, char* trace_buf, size_t buf_size, std::string& status_msg, bool& is_error, std::vector<TraceEntry>& entries, CacheCore& cache, std::vector<std::string>& logs, size_t& current_step, int& active_set, int& active_way, bool& auto_play) {
+    std::ifstream file(filepath);
+    if (!file.is_open()) {
+        status_msg = "Error: Cannot open file: " + filepath;
+        is_error = true;
+        return false;
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string content = buffer.str();
+
+    if (trim(content).empty()) {
+        status_msg = "Error: Trace file is empty.";
+        is_error = true;
+        return false;
+    }
+
+    ParseResult pr = parseTraceTextEx(content);
+    if (!pr.valid) {
+        status_msg = "Error: " + pr.error_message;
+        is_error = true;
+        return false;
+    }
+
+    if (content.size() >= buf_size) {
+        status_msg = "Error: Trace file too large for editor buffer.";
+        is_error = true;
+        return false;
+    }
+
+    snprintf(trace_buf, buf_size, "%s", content.c_str());
+    entries = pr.entries;
+    current_step = 0;
+    cache.reset();
+    logs.clear();
+    active_set = -1;
+    active_way = -1;
+    auto_play = false;
+    status_msg = "Loaded " + std::to_string(entries.size()) + " instructions from " + filepath + ".";
+    is_error = false;
+    logs.push_back("[Info] Loaded " + std::to_string(entries.size()) + " instructions from " + filepath + ".");
+    return true;
 }
 
 // Format execution log entry
@@ -166,7 +233,11 @@ static std::string formatLogEntry(const StepResult& res) {
     if (res.hit) {
         ss << "Cache Hit in Set " << std::dec << res.set_index << ", Way " << res.way;
     } else if (res.evicted) {
-        ss << "Cache Miss in Set " << std::dec << res.set_index << "; Evicting Way " << res.evicted_way << " & Loading line...";
+        if (res.dirty_eviction) {
+            ss << "Cache Miss in Set " << std::dec << res.set_index << "; Evicting Way " << res.evicted_way << " (Dirty eviction) & Loading line...";
+        } else {
+            ss << "Cache Miss in Set " << std::dec << res.set_index << "; Evicting Way " << res.evicted_way << " & Loading line...";
+        }
     } else {
         ss << "Cache Miss in Set " << std::dec << res.set_index << "; Loading line into Way " << res.way << "...";
     }
@@ -295,13 +366,15 @@ int main(int argc, char* argv[]) {
     int custom_associativity = 4;
 
     char trace_buffer[65536] = "R 0x1000\nW 0x1004\nR 0x2000\nR 0x1000\nW 0x2004\nR 0x3000\n";
-    std::vector<TraceEntry> trace_entries = parseTraceText(trace_buffer);
+    char file_path_input[256] = "memory_trace.txt";
+
+    ParseResult initial_pr = parseTraceTextEx(trace_buffer);
+    std::vector<TraceEntry> trace_entries = initial_pr.entries;
     size_t current_step = 0;
 
     std::vector<std::string> execution_logs;
     std::string status_message = "Ready. Edit trace or click Run Simulation.";
     bool status_is_error = false;
-    (void)status_is_error;
 
     int active_set = -1;
     int active_way = -1;
@@ -326,6 +399,18 @@ int main(int argc, char* argv[]) {
     int init_as = ASSOC_OPTIONS[assoc_idx].value;
     cache.configure(init_cs, init_bs, init_as, ReplacementPolicy::LRU);
 
+    auto ensureTraceLoaded = [&]() -> bool {
+        ParseResult pr = parseTraceTextEx(trace_buffer);
+        if (!pr.valid) {
+            status_message = "Error: " + pr.error_message;
+            status_is_error = true;
+            trace_entries.clear();
+            return false;
+        }
+        trace_entries = pr.entries;
+        return true;
+    };
+
     bool running = true;
     while (running) {
         SDL_Event event;
@@ -343,11 +428,11 @@ int main(int argc, char* argv[]) {
             if (elapsed >= auto_play_speed_ms) {
                 last_step_time = now;
 
-                trace_entries = parseTraceText(trace_buffer);
-
                 if (!cache.isConfigured()) {
                     status_message = "Error: Please configure valid cache parameters first.";
                     status_is_error = true;
+                    auto_play = false;
+                } else if (!ensureTraceLoaded()) {
                     auto_play = false;
                 } else if (trace_entries.empty()) {
                     status_message = "Error: Memory trace is empty. Enter instructions below.";
@@ -473,7 +558,7 @@ int main(int argc, char* argv[]) {
                 int as = ASSOC_OPTIONS[assoc_idx].value;
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(cs, bs, as, pol)) {
-                    status_message = "Warning: Selected combination is invalid.";
+                    status_message = "Error: Invalid cache configuration (check block size & associativity).";
                     status_is_error = true;
                 } else {
                     status_message = "Reconfigured: " + std::to_string(cs) + "B Size, " + std::to_string(bs) + "B Block.";
@@ -492,7 +577,7 @@ int main(int argc, char* argv[]) {
                 int as = ASSOC_OPTIONS[assoc_idx].value;
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(cs, bs, as, pol)) {
-                    status_message = "Warning: Block size exceeds cache size.";
+                    status_message = "Error: Block size exceeds cache size.";
                     status_is_error = true;
                 } else {
                     status_message = "Reconfigured: Block size set to " + std::to_string(bs) + " Bytes.";
@@ -511,7 +596,7 @@ int main(int argc, char* argv[]) {
                 int as = ASSOC_OPTIONS[assoc_idx].value;
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(cs, bs, as, pol)) {
-                    status_message = "Warning: Associativity exceeds total available lines.";
+                    status_message = "Error: Associativity exceeds total available lines.";
                     status_is_error = true;
                 } else {
                     status_message = "Reconfigured: Set to " + std::to_string(as) + "-Way Associativity.";
@@ -547,7 +632,7 @@ int main(int argc, char* argv[]) {
             if (ImGui::Button(" Apply Parameters ", ImVec2(-1, 26))) {
                 ReplacementPolicy pol = (selected_policy == 1) ? ReplacementPolicy::FIFO : ((selected_policy == 2) ? ReplacementPolicy::RANDOM : ReplacementPolicy::LRU);
                 if (!cache.configure(custom_cache_size, custom_block_size, custom_associativity, pol)) {
-                    status_message = "Error: Parameters must be Powers of 2.";
+                    status_message = "Error: Parameters must be Powers of 2 & valid cache math constraints.";
                     status_is_error = true;
                 } else {
                     status_message = "Applied custom parameters.";
@@ -565,10 +650,6 @@ int main(int argc, char* argv[]) {
         ImGui::Spacing();
 
         // Toolbar Buttons (Load Trace, Run Simulation, Step, Auto Play, Reset)
-        auto ensureTraceLoaded = [&]() {
-            trace_entries = parseTraceText(trace_buffer);
-        };
-
         float avail_w = ImGui::GetContentRegionAvail().x;
         float item_spacing = ImGui::GetStyle().ItemSpacing.x;
         float btn_w = (avail_w - (item_spacing * 4.0f)) / 5.0f;
@@ -577,20 +658,21 @@ int main(int argc, char* argv[]) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.53f, 0.90f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.18f, 0.62f, 0.98f, 1.0f));
         if (ImGui::Button("Load Trace", ImVec2(btn_w, 34))) {
-            trace_entries = parseTraceText(trace_buffer);
-            current_step = 0;
-            cache.reset();
-            execution_logs.clear();
-            active_set = -1;
-            active_way = -1;
-            auto_play = false;
-            if (trace_entries.empty()) {
-                status_message = "Error: Trace editor is empty. Please enter memory instructions.";
-                status_is_error = true;
-            } else {
-                status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions.";
-                status_is_error = false;
-                execution_logs.push_back("[Info] Loaded " + std::to_string(trace_entries.size()) + " user trace instructions.");
+            if (ensureTraceLoaded()) {
+                current_step = 0;
+                cache.reset();
+                execution_logs.clear();
+                active_set = -1;
+                active_way = -1;
+                auto_play = false;
+                if (trace_entries.empty()) {
+                    status_message = "Error: Trace editor is empty. Please enter memory instructions.";
+                    status_is_error = true;
+                } else {
+                    status_message = "Loaded " + std::to_string(trace_entries.size()) + " instructions.";
+                    status_is_error = false;
+                    execution_logs.push_back("[Info] Loaded " + std::to_string(trace_entries.size()) + " user trace instructions.");
+                }
             }
         }
         ImGui::PopStyleColor(2);
@@ -600,19 +682,55 @@ int main(int argc, char* argv[]) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.00f, 0.78f, 0.38f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.00f, 0.90f, 0.45f, 1.0f));
         if (ImGui::Button("Run Sim", ImVec2(btn_w, 34))) {
-            ensureTraceLoaded();
-
             if (!cache.isConfigured()) {
                 status_message = "Error: Cache configuration invalid.";
                 status_is_error = true;
-            } else if (trace_entries.empty()) {
-                status_message = "Error: Memory trace instructions are empty.";
+            } else if (ensureTraceLoaded()) {
+                if (trace_entries.empty()) {
+                    status_message = "Error: Memory trace instructions are empty.";
+                    status_is_error = true;
+                } else {
+                    current_step = 0;
+                    cache.reset();
+                    execution_logs.clear();
+                    while (current_step < trace_entries.size()) {
+                        const auto& entry = trace_entries[current_step++];
+                        StepResult res = cache.access(entry.op, entry.address);
+                        active_set = res.set_index;
+                        active_way = res.way;
+                        active_hit = res.hit;
+                        active_evicted = res.evicted;
+                        active_addr = res.address;
+                        snprintf(inspect_addr_str, sizeof(inspect_addr_str), "0x%llX", (unsigned long long)res.address);
+                        execution_logs.push_back(formatLogEntry(res));
+                    }
+                    status_message = "Ran all " + std::to_string(trace_entries.size()) + " instructions successfully.";
+                    status_is_error = false;
+                }
+            }
+        }
+        ImGui::PopStyleColor(2);
+
+        // 3. Step Button
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
+        if (ImGui::Button("Step", ImVec2(btn_w, 34))) {
+            if (!cache.isConfigured()) {
+                status_message = "Error: Cache configuration invalid.";
                 status_is_error = true;
-            } else {
-                current_step = 0;
-                cache.reset();
-                execution_logs.clear();
-                while (current_step < trace_entries.size()) {
+            } else if (ensureTraceLoaded()) {
+                if (trace_entries.empty()) {
+                    status_message = "Error: Memory trace instructions are empty.";
+                    status_is_error = true;
+                } else {
+                    if (current_step >= trace_entries.size()) {
+                        current_step = 0;
+                        cache.reset();
+                        execution_logs.clear();
+                        active_set = -1;
+                        active_way = -1;
+                    }
+
                     const auto& entry = trace_entries[current_step++];
                     StepResult res = cache.access(entry.op, entry.address);
                     active_set = res.set_index;
@@ -622,45 +740,13 @@ int main(int argc, char* argv[]) {
                     active_addr = res.address;
                     snprintf(inspect_addr_str, sizeof(inspect_addr_str), "0x%llX", (unsigned long long)res.address);
                     execution_logs.push_back(formatLogEntry(res));
+                    if (current_step >= trace_entries.size()) {
+                        status_message = "Trace execution complete (" + std::to_string(trace_entries.size()) + " instructions).";
+                    } else {
+                        status_message = "Executed Step " + std::to_string(current_step) + " of " + std::to_string(trace_entries.size());
+                    }
+                    status_is_error = false;
                 }
-                status_message = "Ran all " + std::to_string(trace_entries.size()) + " instructions successfully.";
-                status_is_error = false;
-            }
-        }
-        ImGui::PopStyleColor(2);
-
-        // 3. Step Button
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
-        if (ImGui::Button("Step", ImVec2(btn_w, 34))) {
-            ensureTraceLoaded();
-
-            if (!cache.isConfigured()) {
-                status_message = "Error: Cache configuration invalid.";
-                status_is_error = true;
-            } else if (trace_entries.empty()) {
-                status_message = "Error: Memory trace instructions are empty.";
-                status_is_error = true;
-            } else {
-                if (current_step >= trace_entries.size()) {
-                    current_step = 0;
-                    cache.reset();
-                    execution_logs.clear();
-                    active_set = -1;
-                    active_way = -1;
-                }
-
-                const auto& entry = trace_entries[current_step++];
-                StepResult res = cache.access(entry.op, entry.address);
-                active_set = res.set_index;
-                active_way = res.way;
-                active_hit = res.hit;
-                active_evicted = res.evicted;
-                active_addr = res.address;
-                snprintf(inspect_addr_str, sizeof(inspect_addr_str), "0x%llX", (unsigned long long)res.address);
-                execution_logs.push_back(formatLogEntry(res));
-                status_message = "Executed Step " + std::to_string(current_step) + " of " + std::to_string(trace_entries.size());
-                status_is_error = false;
             }
         }
         ImGui::PopStyleColor();
@@ -680,18 +766,19 @@ int main(int argc, char* argv[]) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.45f, 0.35f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.55f, 0.45f, 1.0f));
             if (ImGui::Button("Auto Play", ImVec2(btn_w, 34))) {
-                ensureTraceLoaded();
                 if (!cache.isConfigured()) {
                     status_message = "Error: Configure cache parameters first.";
                     status_is_error = true;
-                } else if (trace_entries.empty()) {
-                    status_message = "Error: Memory trace is empty.";
-                    status_is_error = true;
-                } else {
-                    auto_play = true;
-                    last_step_time = std::chrono::steady_clock::now();
-                    status_message = "Auto-play started.";
-                    status_is_error = false;
+                } else if (ensureTraceLoaded()) {
+                    if (trace_entries.empty()) {
+                        status_message = "Error: Memory trace is empty.";
+                        status_is_error = true;
+                    } else {
+                        auto_play = true;
+                        last_step_time = std::chrono::steady_clock::now();
+                        status_message = "Auto-play started.";
+                        status_is_error = false;
+                    }
                 }
             }
             ImGui::PopStyleColor(2);
@@ -702,7 +789,7 @@ int main(int argc, char* argv[]) {
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.24f, 0.32f, 1.0f));
         if (ImGui::Button("Reset", ImVec2(btn_w, 34))) {
             cache.reset();
-            trace_entries = parseTraceText(trace_buffer);
+            ensureTraceLoaded();
             execution_logs.clear();
             current_step = 0;
             active_set = -1;
@@ -721,6 +808,44 @@ int main(int argc, char* argv[]) {
         ImGui::SameLine(ImGui::GetWindowWidth() - 40.0f);
         ImGui::TextDisabled("...");
         ImGui::Separator();
+
+        // File Path Loader Row
+        ImGui::TextDisabled("Trace File:");
+        ImGui::SameLine();
+        ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x - 100.0f);
+        ImGui::InputText("##FilePathInput", file_path_input, sizeof(file_path_input));
+        ImGui::PopItemWidth();
+
+        ImGui::SameLine();
+        if (ImGui::Button("Load File")) {
+            loadTraceFile(file_path_input, trace_buffer, sizeof(trace_buffer), status_message, status_is_error, trace_entries, cache, execution_logs, current_step, active_set, active_way, auto_play);
+        }
+
+        ImGui::TextDisabled("Presets:");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("memory_trace.txt")) {
+            snprintf(file_path_input, sizeof(file_path_input), "memory_trace.txt");
+            loadTraceFile(file_path_input, trace_buffer, sizeof(trace_buffer), status_message, status_is_error, trace_entries, cache, execution_logs, current_step, active_set, active_way, auto_play);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace.txt")) {
+            snprintf(file_path_input, sizeof(file_path_input), "trace.txt");
+            loadTraceFile(file_path_input, trace_buffer, sizeof(trace_buffer), status_message, status_is_error, trace_entries, cache, execution_logs, current_step, active_set, active_way, auto_play);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace_loop.txt")) {
+            snprintf(file_path_input, sizeof(file_path_input), "trace_loop.txt");
+            loadTraceFile(file_path_input, trace_buffer, sizeof(trace_buffer), status_message, status_is_error, trace_entries, cache, execution_logs, current_step, active_set, active_way, auto_play);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("trace_thrash.txt")) {
+            snprintf(file_path_input, sizeof(file_path_input), "trace_thrash.txt");
+            loadTraceFile(file_path_input, trace_buffer, sizeof(trace_buffer), status_message, status_is_error, trace_entries, cache, execution_logs, current_step, active_set, active_way, auto_play);
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
 
         // Quick Instruction Entry Form
         ImGui::TextDisabled("Add Instruction:");
@@ -743,7 +868,7 @@ int main(int argc, char* argv[]) {
                 size_t currentLen = strlen(trace_buffer);
                 if (currentLen + lineStr.size() < sizeof(trace_buffer)) {
                     strcat(trace_buffer, lineStr.c_str());
-                    trace_entries = parseTraceText(trace_buffer);
+                    ensureTraceLoaded();
                     status_message = "Added instruction: " + trim(lineStr);
                     status_is_error = false;
                 }
@@ -792,7 +917,16 @@ int main(int argc, char* argv[]) {
         // Multiline Text Buffer
         if (ImGui::InputTextMultiline("##TraceEditorArea", trace_buffer, IM_ARRAYSIZE(trace_buffer), 
                                       ImVec2(-1, full_avail_y), ImGuiInputTextFlags_AllowTabInput)) {
-            trace_entries = parseTraceText(trace_buffer);
+            ParseResult pr = parseTraceTextEx(trace_buffer);
+            if (!pr.valid) {
+                status_message = "Warning: " + pr.error_message;
+                status_is_error = true;
+                trace_entries.clear();
+            } else {
+                trace_entries = pr.entries;
+                status_message = "Trace updated (" + std::to_string(trace_entries.size()) + " valid instructions).";
+                status_is_error = false;
+            }
             current_step = 0;
         }
         ImGui::PopStyleVar();

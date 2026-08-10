@@ -189,8 +189,8 @@ private:
                 }
             }
         } else if (m_policy == ReplacementPolicy::RANDOM) {
-            std::uniform_int_distribution<int> dist(0, static_cast<int>(m_associativity - 1));
-            victim = dist(rng);
+            std::uniform_int_distribution<uint32_t> dist(0, m_associativity - 1);
+            victim = static_cast<int>(dist(rng));
         }
         return victim;
     }
